@@ -1,0 +1,10 @@
+{
+  "name": "Mango Overlay Decky",
+  "author": "ccc007ccc",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["utility"],
+    "description": "Shared drawing canvases for the SteamOS overlay."
+  }
+}

@@ -34,6 +34,8 @@
 
 结论：`_uninstall()` 表示“Loader 正在移除当前插件包”，不表示“用户确定永远删除项目”。
 
+Decky 的非 root 插件后端不保证继承登录会话的 `XDG_RUNTIME_DIR` 或 `DBUS_SESSION_BUS_ADDRESS`。插件后端启动任何需要访问当前用户运行时的子进程时，都必须根据自身有效 UID 构造 `/run/user/<uid>` 和对应用户总线地址；这同时适用于生命周期助手的 `systemctl --user` 和管理页面调用的 `mango-overlayctl`，不能依赖 Loader 环境。
+
 ## 两个正交状态机
 
 ### 安装状态
@@ -70,7 +72,7 @@ ready   -> failed -> system_fallback
 ```text
 ~/homebrew/plugins/mango-overlay-decky/          Decky 当前插件包
 ~/.local/libexec/mango-overlay-decky/            稳定启动与生命周期助手
-~/.local/share/mango-overlay-decky/runtime/       版本化运行时
+~/.local/share/mango-overlay-decky/runtime/       内容寻址的不可变运行时修订
 ~/.local/state/mango-overlay-decky/               事务、活动版本和有界日志
 ~/.config/mango-overlay-decky/                    用户设置
 ~/.cache/mango-overlay-decky/                     可重新生成的资源缓存
@@ -80,7 +82,19 @@ ready   -> failed -> system_fallback
   mango-overlayd.service                          场景代理进程
 ```
 
-运行时目录使用版本化子目录，并维护原子 `active` 与 `previous` 指针。最终路径和 Decky 插件标识在实现前固定，之后不得根据模糊名称或目录扫描删除文件。
+每份运行时清单经规范化后生成 SHA-256 修订 ID，目录以修订 ID 命名。`install.json` 分别记录对外的 `active_version` / `previous_version`、内部的 `active_runtime` / `previous_runtime` 和当前插件 generation。相同版本、相同内容的 Loader 重载复用修订且不重启；相同版本、不同内容的测试包按正常更新事务切换到新修订，旧修订仍可回滚。路径和 Decky 插件标识已经固定，清理不得根据模糊名称或目录扫描删除文件。
+
+活动修订同时拥有两种模式的文件：
+
+```text
+runtime/bin/                                  MangoApp、代理、控制器和测试提供者
+runtime/lib/                                  游戏模式依赖与 x86_64 桌面注入库
+runtime/lib32/                                i686 桌面注入库与私有依赖
+runtime/share/vulkan/implicit_layer.d/        两种 ABI 的相对路径 manifest
+runtime/licenses/                             随包私有库许可证
+```
+
+双模式文件属于同一份清单和修订，不能单独更新某一种模式。
 
 ## 首次安装
 
@@ -88,10 +102,10 @@ ready   -> failed -> system_fallback
 
 1. 获取生命周期锁。
 2. 清除属于本次安装的过期待确认卸载记录。
-3. 把插件包内运行时复制到同文件系统的临时版本目录。
-4. 校验清单、文件权限和架构，运行 `--self-test` 与协议兼容检查。
-5. 原子重命名为正式版本目录。
-6. 原子设置 `active` 指针。
+3. 根据清单生成运行时修订 ID，并把插件包内运行时复制到同文件系统的临时修订目录。
+4. 校验清单、文件权限、游戏模式自检、桌面双 ABI ELF 和 Vulkan manifest。
+5. 原子重命名为正式修订目录。
+6. 原子提交包含活动版本、活动修订和回滚修订的安装状态。
 7. 安装指向稳定启动助手的用户级 service drop-in。
 8. 安装 `mango-overlayd.socket` 与对应服务单元，执行 `systemctl --user daemon-reload` 并启用 socket。
 9. 仅当 `gamescope-mangoapp.service` 原本处于活动状态时热重启；服务未运行时不擅自启动游戏模式组件。
@@ -105,12 +119,14 @@ ready   -> failed -> system_fallback
 2. 请求稳定生命周期助手稍后核对插件是否重新出现。
 3. 在 Decky 的五秒停止期限内立即返回。
 
+若首次安装尚未提交，`_uninstall()` 先按事务记录恢复安装前状态；恢复后没有活动版本即视为半安装已清理，不创建待确认卸载。
+
 新版本 `_main()` 启动后：
 
 1. 获取同一生命周期锁。
 2. 通过插件标识确认自己是合法替代版本，并取消待确认卸载。
-3. 把新运行时写入独立暂存目录并完整验证。
-4. 保留当前 `active` 为 `previous`，再原子切换 `active`。
+3. 把新运行时写入独立暂存目录并完整验证；包版本相同但清单内容不同仍是新修订。
+4. 保留当前活动修订为回滚修订，再原子切换活动修订。
 5. 仅在 MangoApp 服务原本活动时热重启并等待新版本就绪。
 6. 启动失败则原子恢复 `previous`；再次失败才回退系统 MangoApp。
 7. 成功后提交版本状态，并只保留一个已验证回滚版本。
@@ -122,6 +138,25 @@ ready   -> failed -> system_fallback
 - Decky 未能安装新插件：插件目录持续缺失，延迟核对转入最终卸载。
 
 项目不提供第二套“更新后台”按钮。插件包、运行时和 Decky 前端作为同一版本发布，由 Decky 更新一次完成。
+
+## 桌面游戏运行会话
+
+安装完成后，每个 KDE Steam 游戏使用同一个启动选项：
+
+```text
+~/.local/libexec/mango-overlay-decky/launcher.py desktop -- %command%
+```
+
+稳定启动器只读取已验证的活动修订，并在 `exec` 游戏前完成以下工作：
+
+- 用 `$LIB` 为当前进程选择 `runtime/lib` 或 `runtime/lib32`。
+- 预加载项目自己的 `libMangoHud_shim.so`，并移除继承环境中冲突的同名 shim。
+- 为 Vulkan 指向包内两种 ABI 的隐式层 manifest。
+- 把 `/run/user/<uid>/mango-overlay-decky.sock` 传播给原生、Steam Runtime 和 Proton。
+- 默认使用 `no_display=1` 保持系统统计与提供者画布独立；用户显式配置优先。
+
+启动失败或游戏退出只影响该桌面运行会话。它不写安装状态、不创建卸载记录，也不
+切换活动或回滚修订。
 
 ## 最终卸载
 
@@ -142,6 +177,17 @@ ready   -> failed -> system_fallback
 
 不得递归删除未经清单验证的路径，不得跟随符号链接，也不得因为文件所有权或 schema 无法确认而强行清理。
 
+## 紧急恢复系统 MangoApp
+
+真实会话出现异常时，可以保留运行时、设置和安装状态，只移除本项目的 MangoApp drop-in 并恢复系统服务：
+
+```bash
+python3 ~/.local/libexec/mango-overlay-decky/lifecycle.py \
+  restore-system --home "$HOME"
+```
+
+命令只在 `gamescope-mangoapp.service` 原本运行时重启它；不会卸载插件、删除版本或写入待确认卸载。之后重新加载插件会恢复受管 drop-in，但当前会话保持系统 MangoApp，直到服务下次重启。
+
 ## 休眠、关机和普通重载
 
 这些事件只允许执行：
@@ -155,7 +201,7 @@ ready   -> failed -> system_fallback
 
 - 写入待确认卸载。
 - 删除运行时、配置、缓存或 drop-in。
-- 改变 `active`/`previous` 指针。
+- 改变活动版本或回滚版本。
 - 将正常 `SIGTERM` 计为崩溃。
 - 在关机过程中启动更新、回滚或最终卸载。
 

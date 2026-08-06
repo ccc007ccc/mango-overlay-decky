@@ -37,6 +37,7 @@ lib32-mangohud*.tar.*
 *.app
 
 # subprojects
+subprojects/.wraplock
 subprojects/packagecache/
 subprojects/Vulkan-Headers-*/
 subprojects/imgui-*/
@@ -44,6 +45,11 @@ subprojects/spdlog-*/
 subprojects/nlohmann_json-*/
 subprojects/implot-*/
 subprojects/cmocka/
+client/rust/target/
+client/rust/Cargo.lock
+plugin/node_modules/
+plugin/dist/
+build/package/
 
 #GNU Global Metadata
 **/GPATH
