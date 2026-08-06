@@ -1,7 +1,7 @@
 # ADR 0001：第一版只实现 SteamOS 游戏模式绘制平台
 
 日期：2026-08-05  
-状态：已接受
+状态：已被 [ADR 0015](./0015-first-release-supports-game-and-desktop-games.md) 取代
 
 ## 背景
 

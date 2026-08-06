@@ -1,0 +1,170 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Protocol, runtime, plugin, and package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout with upstream submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build and verification dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            cargo \
+            flatbuffers-compiler \
+            glslang-tools \
+            libegl-dev \
+            libflatbuffers-dev \
+            libgif-dev \
+            libgl-dev \
+            libglfw3-dev \
+            libjpeg-dev \
+            libpng-dev \
+            libvulkan-dev \
+            libwayland-dev \
+            libwebp-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            meson \
+            ninja-build \
+            pkg-config \
+            python3-mako \
+            shellcheck
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.9
+
+      - name: Select Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: plugin/pnpm-lock.yaml
+
+      - name: Build Decky frontend
+        run: |
+          pnpm --dir plugin install --frozen-lockfile
+          pnpm --dir plugin verify
+
+      - name: Check shell and repository hygiene
+        run: |
+          git diff --check
+          mapfile -t scripts < <(git ls-files 'packaging/*.sh' 'tools/*.sh')
+          shellcheck "${scripts[@]}"
+          for script in "${scripts[@]}"; do
+            bash -n "${script}"
+          done
+
+      - name: Configure dual-mode runtime tests
+        run: |
+          meson setup build/ci . \
+            --buildtype=debug \
+            -Dinclude_doc=false \
+            -Dmango_overlay_decky=enabled \
+            -Dmangoapp=true \
+            -Dmangohudctl=false \
+            -Dmangoplot=disabled \
+            -Dtests=enabled \
+            -Dwith_dbus=disabled \
+            -Dwith_nvml=disabled \
+            -Dwith_xnvctrl=disabled
+
+      - name: Build and run the complete test suite
+        run: |
+          meson compile -C build/ci
+          meson test -C build/ci --print-errorlogs --no-rebuild
+
+  i686:
+    name: i686 Vulkan and OpenGL injection libraries
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout with upstream submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install multilib dependencies
+        run: |
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            file \
+            flatbuffers-compiler \
+            g++-multilib \
+            gcc-multilib \
+            glslang-tools \
+            libegl-dev:i386 \
+            libflatbuffers-dev:i386 \
+            libgif-dev:i386 \
+            libgl-dev:i386 \
+            libjpeg-dev:i386 \
+            libpng-dev:i386 \
+            libvulkan-dev:i386 \
+            libwayland-dev:i386 \
+            libwebp-dev:i386 \
+            libx11-dev:i386 \
+            libxkbcommon-dev:i386 \
+            meson \
+            ninja-build \
+            pkg-config \
+            python3-mako
+
+      - name: Configure and build i686 injection libraries
+        env:
+          CC: gcc -m32
+          CXX: g++ -m32
+          PKG_CONFIG_LIBDIR: /usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig
+        run: |
+          meson setup build/i686 . \
+            --buildtype=release \
+            -Dinclude_doc=false \
+            -Dmango_overlay_decky=enabled \
+            -Dmangoapp=false \
+            -Dmangohudctl=false \
+            -Dmangoplot=disabled \
+            -Dtests=disabled \
+            -Dwith_dbus=disabled \
+            -Dwith_nvml=disabled \
+            -Dwith_xnvctrl=disabled
+          meson compile -C build/i686 \
+            src/libMangoHud.so \
+            src/libMangoHud_opengl.so \
+            src/libMangoHud_shim.so
+
+      - name: Verify i686 ABI and dependencies
+        run: |
+          artifacts=(
+            build/i686/src/libMangoHud.so
+            build/i686/src/libMangoHud_opengl.so
+            build/i686/src/libMangoHud_shim.so
+          )
+          for artifact in "${artifacts[@]}"; do
+            file -Lb "${artifact}" | grep -F 'ELF 32-bit LSB shared object, Intel 80386'
+            readelf -h "${artifact}" | grep -Eq 'Class:[[:space:]]+ELF32'
+            readelf -h "${artifact}" | grep -Eq 'Machine:[[:space:]]+Intel 80386'
+            if ldd "${artifact}" | grep -F 'not found'; then
+              exit 1
+            fi
+          done
+          grep -Fq 'VK_LAYER_MANGOHUD_overlay_x86' \
+            build/i686/src/MangoHud.x86.json

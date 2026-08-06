@@ -2,13 +2,23 @@
 
 面向 SteamOS 的共享覆盖层绘制平台。第三方程序可以通过稳定接口在指定坐标绘制文字、图形、图片和动画，不需要各自实现 Gamescope 或 MangoHud 集成。
 
-当前处于架构阶段，尚无可安装版本。
+当前已完成共享数据面、基础绘制、图片/GIF、C/C++/Python/Rust 提供者 SDK，以及 Decky 安装、原子更新、回滚和延迟确认卸载。游戏模式使用 MangoApp/Gamescope；桌面游戏使用双 ABI MangoHud Vulkan/OpenGL 注入，并复用同一场景核心。项目仍处于首版设备验收阶段。
 
 ## 范围
 
-- 第一阶段：SteamOS 游戏模式的 MangoApp/Gamescope 渲染器。
-- 后续阶段：SteamOS 桌面模式游戏的 MangoHud Vulkan/OpenGL 渲染器。
+- 第一版：SteamOS 游戏模式的 MangoApp/Gamescope 渲染器。
+- 第一版：KDE 中启动的原生、Steam Runtime 和 Proton 游戏，通过 MangoHud Vulkan/OpenGL 注入渲染。
 - 不采集 FPS，不内置业务监控，不提供 KDE 桌面常驻窗口。
+
+## 使用模式
+
+Decky 安装同一个包后，游戏模式由用户级 `gamescope-mangoapp.service` drop-in 自动选择当前活动运行时。桌面游戏需要把 Steam 启动选项设置为：
+
+```text
+~/.local/libexec/mango-overlay-decky/launcher.py desktop -- %command%
+```
+
+桌面启动器会自动选择 `x86_64`/`i686` Vulkan 与 OpenGL 注入库，并把同一个场景代理 socket 传播到原生游戏、Steam Runtime 和 Proton。默认只显示提供者画布；如果用户显式设置 `MANGOHUD_CONFIG`，原生 MangoHud 统计仍可同时显示。
 
 ## 文档
 
@@ -17,6 +27,7 @@
 - [安装、更新与卸载](docs/lifecycle.md)
 - [调试方法](docs/debugging.md)
 - [实现计划](docs/implementation-plan.md)
+- [SDK 使用与测试](docs/sdk.md)
 - [领域语言](CONTEXT.md)
 - [架构决策](docs/adr/)
 
@@ -28,3 +39,14 @@ SteamOS 宿主保持不可变。编译、依赖安装和开发测试使用：
 distrobox enter dev
 ```
 
+正式测试包只在 `dev` 中构建：
+
+```bash
+distrobox enter dev -- ./packaging/build-steamrt4.sh
+```
+
+产物位于 `build/package/`。构建器固定 Steam Runtime 4 版本和 SHA-256，在断网沙箱内编译游戏模式运行时和两种桌面 ABI，并生成带逐文件哈希的确定性 Decky zip；它不会替换宿主 `/usr/bin/mangoapp`。
+
+## 许可证
+
+项目以 MIT 协议开源，并保留 MangoHud 上游 Git 历史、版权和第三方运行时许可证。
