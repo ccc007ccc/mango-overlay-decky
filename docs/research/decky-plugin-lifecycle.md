@@ -130,13 +130,15 @@ Recorder 保留视频，CSS Loader 保留主题和 symlink，Framegen 保留游�
 
 ## 本项目发现与修复状态
 
-以下实机发现基于公开提交 [`3ade79a3b47385b544bd1bb8473cfd69df8624c0`](https://github.com/ccc007ccc/mango-overlay-decky/tree/3ade79a3b47385b544bd1bb8473cfd69df8624c0)。对应修复已经完成离线回归，但真实 Decky 更新与卸载仍需用新包复测。
+以下实机发现基于公开提交 [`3ade79a3b47385b544bd1bb8473cfd69df8624c0`](https://github.com/ccc007ccc/mango-overlay-decky/tree/3ade79a3b47385b544bd1bb8473cfd69df8624c0)。对应修复已经完成离线回归，新包的真实 Decky 卸载已经通过；正常更新与故障更新仍需继续复测。
 
-### 1. `_uninstall()` 的五秒超时：已修复，待实机确认
+### 1. `_uninstall()` 的五秒超时：已修复并通过实机确认
 
 旧实现通过 `asyncio.to_thread()` 等待 `mark_pending_uninstall()`，而后者在持有生命周期锁期间同步启动 cleanup oneshot。2026-08-06 21:33 的 Decky `v3.2.8-pre1` 实机日志显示：21:33:00.604 已进入 `_uninstall()`，cleanup service 曾启动并因旧插件目录仍存在而返回 `false`，但回调始终没有记录 `verification armed`；21:33:05 Loader 对仍未退出的后端发送 SIGKILL。该反馈环明确复现了“pending 已交接但回调没有在 Loader 期限内返回”的用户症状。
 
-当前实现让 `_uninstall()` 在事件循环线程完成小型原子 pending 落盘，随后只执行一秒上限的 `systemctl --user --no-block restart mango-overlay-cleanup.timer`。它不再同步启动或等待 cleanup service。针对性测试会让同步 cleanup service 模拟阻塞 0.5 秒，并要求 pending handoff 在 0.25 秒内返回；完整插件测试当前为 53 项通过。
+当前实现让 `_uninstall()` 在事件循环线程完成小型原子 pending 落盘，随后只执行一秒上限的 `systemctl --user --no-block restart mango-overlay-cleanup.timer`。它不再同步启动或等待 cleanup service。针对性测试会让同步 cleanup service 模拟阻塞 0.5 秒，并要求 pending handoff 在 0.25 秒内返回；完整插件测试为 53 项通过。
+
+2026-08-06 23:10 的真实 Decky 卸载复测显示：23:10:15 进入 `_uninstall()`，同一秒记录 `Mango Overlay uninstall verification armed`，Loader 报告插件在 0.1 秒内停止，没有 SIGKILL；23:10:18 finalizer 进入最终清理，约 23:10:20 已移除项目运行时、状态、用户 units、MangoApp drop-in 和三个 Decky 保留目录。系统 `gamescope-mangoapp.service` 最终只加载 `/usr/lib/systemd/user/gamescope-mangoapp.service`，没有 drop-in、失败 unit 或残留项目进程。
 
 ### 2. cleanup timer 的空闲唤醒：已修复
 
@@ -202,16 +204,16 @@ finalizer
 
 当前 finalizer 不只相信旧目录名；它会在 Decky plugins 根目录中解析有界、受验证的 `plugin.json`，按插件标识确认替代版本，以兼容未来包顶层目录名变化。清理仍需保持幂等、拒绝符号链接、只删除所有权清单中的路径，并在重启后继续完成中断的最终卸载。
 
-### 剩余验收条件
+### 验收条件与状态
 
-1. **真实卸载延迟：** 点击 Decky 卸载后 5 秒内恢复系统 MangoApp、停止项目服务并删除项目所属文件。
+1. **真实卸载延迟（已通过）：** 点击 Decky 卸载后，回调 0.1 秒返回，约 5 秒内恢复系统 MangoApp、停止项目服务并删除项目所属文件。
 2. **正常更新：** 旧版本 `_uninstall()` 被调用，但新插件目录出现后 finalizer 不清理；新版本验证并原子激活，Steam 统计和 provider 画布保持独立。
 3. **慢启动更新：** 新目录已解压但新 `_main()` 故意延迟，目录身份检查仍保护旧运行时，随后由新版本取消 pending。
 4. **损坏更新：** Loader 删除旧插件后散列失败、插件保持缺失，finalizer 最终恢复系统状态且不留下孤儿服务。
 5. **重载与禁用：** 只执行 `_unload()`，不产生 pending uninstall，不改变 drop-in、活动 runtime 或用户总开关。
 6. **finalizer 中断：** 清理中断或设备重启后能根据 token/事务记录安全重试。
 
-其中重载/禁用、目录身份、旧 pending、扫描上限、精确清理和非阻塞 handoff 已有自动化回归；1–4 仍需要真实 Decky Loader 和 SteamOS 会话证据。
+其中真实卸载延迟、重载/禁用、目录身份、旧 pending、扫描上限、精确清理和非阻塞 handoff 已通过；正常更新、慢启动更新和损坏更新仍需要真实 Decky Loader 与 SteamOS 会话证据。
 
 ## 最终判断
 
