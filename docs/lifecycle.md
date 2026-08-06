@@ -76,6 +76,9 @@ ready   -> failed -> system_fallback
 ~/.local/state/mango-overlay-decky/               事务、活动版本和有界日志
 ~/.config/mango-overlay-decky/                    用户设置
 ~/.cache/mango-overlay-decky/                     可重新生成的资源缓存
+~/homebrew/settings/mango-overlay-decky/          Decky 设置目录
+~/homebrew/data/mango-overlay-decky/              Decky 运行数据目录
+~/homebrew/logs/mango-overlay-decky/              Decky 普通日志目录
 ~/.config/systemd/user/
   gamescope-mangoapp.service.d/                   MangoApp 用户级服务 drop-in
   mango-overlayd.socket                           场景代理 socket activation
@@ -114,9 +117,16 @@ runtime/licenses/                             随包私有库许可证
 
 旧版本 `_uninstall()` 只能：
 
-1. 写入带唯一事务 ID 和时间戳的待确认卸载记录。
-2. 请求稳定生命周期助手稍后核对插件是否重新出现。
+1. 在插件事件循环线程中原子写入带唯一 token、generation、时间戳以及旧插件目录
+   device/inode 的待确认卸载记录。
+2. 用一秒上限的 `systemctl --user --no-block restart` 请求稳定生命周期助手稍后核对，
+   不同步启动或等待 cleanup oneshot。
 3. 在 Decky 的五秒停止期限内立即返回。
+
+cleanup timer 的确认窗口为 3 秒；只要旧目录仍存在、同路径出现身份不明的半解压目录，
+或扫描无法安全完成，就保持旧运行时并每 5 秒重试。timer 安装时只执行 `enable`，作为
+用户管理器重启后恢复遗留 pending 的保险，不在正常安装时启动；pending 被替代版本取消
+或根本不存在时会立即停止，不在正常运行中周期唤醒 cleanup service。
 
 若首次安装尚未提交，`_uninstall()` 先按事务记录恢复安装前状态；恢复后没有活动版本即视为半安装已清理，不创建待确认卸载。
 
@@ -156,7 +166,10 @@ runtime/licenses/                             随包私有库许可证
 延迟核对只有同时满足以下条件才开始清理：
 
 - 存在有效的待确认卸载记录。
-- Decky 插件根目录中不存在相同插件标识的有效 `plugin.json`。
+- 记录中的原旧插件目录 device/inode 已经消失。
+- 旧路径没有处于半解压、身份不明的状态。
+- 在旧路径父目录最多 256 个条目的有界扫描中，不存在相同插件标识的有效
+  `plugin.json`；旧版没有目录身份字段的 pending 记录也按这条安全路径兼容处理。
 - 记录没有被新版本 `_main()` 取消。
 - 当前没有安装或更新事务持有生命周期锁。
 
@@ -165,7 +178,9 @@ runtime/licenses/                             随包私有库许可证
 1. 获取生命周期锁并再次验证上述条件。
 2. 停止并移除场景代理 socket/service 和本项目的 MangoApp service drop-in，执行 `daemon-reload`。
 3. 如果 MangoApp 服务正在运行，热重启并验证已回到 `/usr/bin/mangoapp`；服务未运行则保持未运行。
-4. 删除版本化运行时、资源缓存、IPC 残留、项目设置和常规日志。
+4. 删除版本化运行时、资源缓存、IPC 残留、项目设置和常规日志，并精确删除 Decky
+   为本插件保留的 `settings/mango-overlay-decky`、`data/mango-overlay-decky` 和
+   `logs/mango-overlay-decky`；不得删除这些目录的父目录或其他插件的相邻数据。
 5. 最后删除生命周期状态和稳定助手；只有清理失败时保留最小诊断记录，待恢复成功后再删除。
 
 不得递归删除未经清单验证的路径，不得跟随符号链接，也不得因为文件所有权或 schema 无法确认而强行清理。
@@ -212,5 +227,6 @@ python3 ~/.local/libexec/mango-overlay-decky/lifecycle.py \
 | 休眠/恢复 | 不变 | 恢复活动版本，不产生卸载记录 |
 | 关机/开机 | 不变 | 开机后继续使用活动版本 |
 | Decky 更新成功 | 切换到新版本 | 验证后热切换，失败回滚 |
+| 更新时新目录仍在解压 | 保持 pending | 不清理旧运行时，等待目录身份明确或新版本取消 |
 | Decky 更新中断 | 旧版本或可验证的新版本 | 不留下半安装活动版本 |
-| 用户从 Decky 卸载 | 最终变为 absent | 恢复系统 MangoApp 并清理所属文件 |
+| 用户从 Decky 卸载 | 数秒内最终变为 absent | 恢复系统 MangoApp 并清理所属文件 |

@@ -5,6 +5,7 @@ import importlib.util
 import os
 import sys
 import subprocess
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -103,6 +104,27 @@ class PluginTests(unittest.IsolatedAsyncioTestCase):
         plugin._manager.mark_pending_uninstall.assert_called_once_with(
             Path("/plugin"), "a" * 32
         )
+
+    async def test_uninstall_records_pending_on_event_loop_thread(self) -> None:
+        decky = fake_decky()
+        module = load_plugin(decky)
+        plugin = module.Plugin()
+        callback_thread = threading.get_ident()
+        mark_threads: list[int] = []
+        plugin._manager = types.SimpleNamespace(
+            mark_pending_uninstall=Mock(
+                side_effect=lambda *_: (
+                    mark_threads.append(threading.get_ident()),
+                    "b" * 32,
+                )[1]
+            )
+        )
+        plugin._generation = "a" * 32
+        plugin._plugin_root = Path("/plugin")
+
+        await plugin._uninstall()
+
+        self.assertEqual(mark_threads, [callback_thread])
 
     async def test_uninstall_accepts_a_recovered_partial_install(self) -> None:
         decky = fake_decky()

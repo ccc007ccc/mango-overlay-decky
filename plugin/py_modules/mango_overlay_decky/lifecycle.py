@@ -21,7 +21,8 @@ from typing import Callable, Iterator, Protocol, Sequence
 PLUGIN_NAME = "Mango Overlay Decky"
 STATE_SCHEMA = 1
 MANIFEST_SCHEMA = 1
-UNINSTALL_GRACE_SECONDS = 60.0
+UNINSTALL_GRACE_SECONDS = 3.0
+MAX_PLUGIN_DIRECTORIES = 256
 _VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
 _GENERATION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{7,127}")
 _TOKEN = re.compile(r"[a-f0-9]{32,64}")
@@ -92,6 +93,9 @@ class LifecyclePaths:
     libexec_root: Path
     config_root: Path
     cache_root: Path
+    decky_settings_root: Path
+    decky_runtime_root: Path
+    decky_logs_root: Path
     systemd_user_root: Path
     mangoapp_dropin: Path
 
@@ -100,6 +104,7 @@ class LifecyclePaths:
         home = home.absolute()
         data_root = home / ".local/share/mango-overlay-decky"
         state_root = home / ".local/state/mango-overlay-decky"
+        decky_root = home / "homebrew"
         systemd_user_root = home / ".config/systemd/user"
         return cls(
             home=home,
@@ -113,6 +118,9 @@ class LifecyclePaths:
             libexec_root=home / ".local/libexec/mango-overlay-decky",
             config_root=home / ".config/mango-overlay-decky",
             cache_root=home / ".cache/mango-overlay-decky",
+            decky_settings_root=decky_root / "settings/mango-overlay-decky",
+            decky_runtime_root=decky_root / "data/mango-overlay-decky",
+            decky_logs_root=decky_root / "logs/mango-overlay-decky",
             systemd_user_root=systemd_user_root,
             mangoapp_dropin=(
                 systemd_user_root
@@ -121,21 +129,35 @@ class LifecyclePaths:
         )
 
 
-def _default_run(command: list[str]) -> subprocess.CompletedProcess[str]:
+def _command_environment() -> dict[str, str]:
     environment = os.environ.copy()
     runtime_directory = f"/run/user/{os.geteuid()}"
     environment["XDG_RUNTIME_DIR"] = runtime_directory
     environment["DBUS_SESSION_BUS_ADDRESS"] = (
         f"unix:path={runtime_directory}/bus"
     )
+    return environment
+
+
+def _run_command(
+    command: list[str], timeout: float
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         command,
         check=False,
         capture_output=True,
         text=True,
-        timeout=15,
-        env=environment,
+        timeout=timeout,
+        env=_command_environment(),
     )
+
+
+def _default_run(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return _run_command(command, 15)
+
+
+def _default_run_quick(command: list[str]) -> subprocess.CompletedProcess[str]:
+    return _run_command(command, 1)
 
 
 def _elf_identity(path: Path) -> tuple[int, int]:
@@ -275,12 +297,14 @@ class LifecycleManager:
         paths: LifecyclePaths,
         *,
         run_command: CommandRunner = _default_run,
+        run_quick_command: CommandRunner = _default_run_quick,
         verify_runtime: RuntimeVerifier = _default_verify_runtime,
         now: Callable[[], float] = time.time,
         token_factory: Callable[[], str] = lambda: secrets.token_hex(16),
     ) -> None:
         self.paths = paths
         self._run_command = run_command
+        self._run_quick_command = run_quick_command
         self._verify_runtime = verify_runtime
         self._now = now
         self._token_factory = token_factory
@@ -423,7 +447,9 @@ class LifecycleManager:
                 raise LifecycleError("activation_failed", str(error)) from error
 
             self._unlink_if_exists(self.paths.transaction_file)
-            self._unlink_if_exists(self.paths.pending_uninstall_file)
+            if self._path_exists(self.paths.pending_uninstall_file):
+                self._unlink_if_exists(self.paths.pending_uninstall_file)
+                self._stop_cleanup_timer()
             self._prune_versions(state)
             return state
 
@@ -445,6 +471,7 @@ class LifecycleManager:
                     "The uninstall callback does not own the active generation",
                 )
             self._validate_plugin(plugin_root, state.active_version)
+            plugin_info = plugin_root.lstat()
             token = self._token_factory()
             if _TOKEN.fullmatch(token) is None:
                 raise LifecycleError("invalid_token", "Invalid uninstall token")
@@ -455,26 +482,35 @@ class LifecycleManager:
                     "token": token,
                     "generation": generation,
                     "plugin_root": str(plugin_root),
+                    "plugin_device": plugin_info.st_dev,
+                    "plugin_inode": plugin_info.st_ino,
                     "created_at": self._now(),
                 },
             )
-        self._checked_systemctl("start", "mango-overlay-cleanup.timer")
-        self._checked_systemctl("start", "mango-overlay-cleanup.service")
+        self._checked_systemctl_quick(
+            "--no-block", "restart", "mango-overlay-cleanup.timer"
+        )
         return token
 
     def finalize_pending_uninstall(self, token: str | None = None) -> bool:
         with self._locked():
             pending = self._read_pending()
             if pending is None:
+                self._stop_cleanup_timer()
                 return False
             if token is not None and pending["token"] != token:
                 return False
             state = self._read_state()
             if state is None or state.generation != pending["generation"]:
                 self._unlink_if_exists(self.paths.pending_uninstall_file)
+                self._stop_cleanup_timer()
                 return False
-            plugin_root = Path(pending["plugin_root"])
-            if self._path_exists(plugin_root):
+            plugin_presence = self._pending_plugin_presence(pending)
+            if plugin_presence == "original" or plugin_presence == "ambiguous":
+                return False
+            if plugin_presence == "replacement":
+                self._unlink_if_exists(self.paths.pending_uninstall_file)
+                self._stop_cleanup_timer()
                 return False
             if self._now() - pending["created_at"] < UNINSTALL_GRACE_SECONDS:
                 return False
@@ -484,6 +520,9 @@ class LifecycleManager:
                 self.paths.libexec_root,
                 self.paths.config_root,
                 self.paths.cache_root,
+                self.paths.decky_settings_root,
+                self.paths.decky_runtime_root,
+                self.paths.decky_logs_root,
                 self.paths.state_root,
             )
             gamescope_was_active = self._gamescope_active()
@@ -712,7 +751,8 @@ class LifecycleManager:
             ),
             self.paths.systemd_user_root / "mango-overlay-cleanup.timer": (
                 "[Unit]\nDescription=Check Mango Overlay Decky uninstall state\n\n"
-                "[Timer]\nOnBootSec=60s\nOnUnitActiveSec=60s\n"
+                "[Timer]\nOnActiveSec=3s\nOnUnitActiveSec=5s\n"
+                "AccuracySec=500ms\n"
                 "Unit=mango-overlay-cleanup.service\n\n"
                 "[Install]\nWantedBy=timers.target\n"
             ),
@@ -856,11 +896,11 @@ class LifecycleManager:
 
     def _reload_and_enable_integration(self) -> None:
         self._checked_systemctl("daemon-reload")
+        self._checked_systemctl("enable", "mango-overlay-cleanup.timer")
         self._checked_systemctl(
             "enable",
             "--now",
             "mango-overlayd.socket",
-            "mango-overlay-cleanup.timer",
         )
 
     def _rollback_running_services(
@@ -946,6 +986,68 @@ class LifecycleManager:
         ):
             raise LifecycleError("invalid_plugin", "Decky plugin identity differs")
 
+    def _pending_plugin_presence(self, pending: dict[str, object]) -> str:
+        plugin_root = Path(str(pending["plugin_root"]))
+        try:
+            plugin_info = plugin_root.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise LifecycleError(
+                "plugin_scan_failed", f"Could not inspect plugin root: {error}"
+            ) from error
+        else:
+            device = pending.get("plugin_device")
+            inode = pending.get("plugin_inode")
+            if device is None or inode is None:
+                return "ambiguous"
+            if plugin_info.st_dev == device and plugin_info.st_ino == inode:
+                return "original"
+            if self._plugin_identity_matches(plugin_root):
+                return "replacement"
+            return "ambiguous"
+
+        plugins_root = plugin_root.parent
+        try:
+            plugins_info = plugins_root.lstat()
+        except FileNotFoundError:
+            return "absent"
+        except OSError as error:
+            raise LifecycleError(
+                "plugin_scan_failed", f"Could not inspect plugins root: {error}"
+            ) from error
+        if not _plugin_directory_is_trusted(plugins_info, self._uid):
+            raise LifecycleError("unsafe_plugin_root", "Decky plugins root is unsafe")
+
+        count = 0
+        try:
+            for candidate in plugins_root.iterdir():
+                count += 1
+                if count > MAX_PLUGIN_DIRECTORIES:
+                    raise LifecycleError(
+                        "too_many_plugins",
+                        "Decky plugins root has too many entries",
+                    )
+                if self._plugin_identity_matches(candidate):
+                    return "replacement"
+        except OSError as error:
+            raise LifecycleError(
+                "plugin_scan_failed", f"Could not scan plugins root: {error}"
+            ) from error
+        return "absent"
+
+    def _plugin_identity_matches(self, plugin_root: Path) -> bool:
+        try:
+            info = plugin_root.lstat()
+            if not _plugin_directory_is_trusted(info, self._uid):
+                return False
+            plugin_manifest = self._read_plugin_json(
+                plugin_root / "plugin.json", 65536
+            )
+        except (FileNotFoundError, OSError, LifecycleError):
+            return False
+        return plugin_manifest.get("name") == PLUGIN_NAME
+
     def _read_state(self) -> LifecycleState | None:
         if not self._path_exists(self.paths.state_file):
             return None
@@ -1001,6 +1103,8 @@ class LifecycleManager:
         token = raw.get("token")
         generation = raw.get("generation")
         plugin_root = raw.get("plugin_root")
+        plugin_device = raw.get("plugin_device")
+        plugin_inode = raw.get("plugin_inode")
         created_at = raw.get("created_at")
         if (
             raw.get("schema") != STATE_SCHEMA
@@ -1010,6 +1114,16 @@ class LifecycleManager:
             or _GENERATION.fullmatch(generation) is None
             or not isinstance(plugin_root, str)
             or not Path(plugin_root).is_absolute()
+            or (plugin_device is None) != (plugin_inode is None)
+            or (
+                plugin_device is not None
+                and (
+                    not isinstance(plugin_device, int)
+                    or plugin_device < 0
+                    or not isinstance(plugin_inode, int)
+                    or plugin_inode < 0
+                )
+            )
             or not isinstance(created_at, (int, float))
         ):
             raise LifecycleError("invalid_pending", "Pending uninstall state is invalid")
@@ -1039,6 +1153,29 @@ class LifecycleManager:
                 "systemctl_failed",
                 f"{' '.join(command)} failed: {detail}",
             )
+
+    def _checked_systemctl_quick(self, *arguments: str) -> None:
+        command = ["systemctl", "--user", *arguments]
+        try:
+            result = self._run_quick_command(command)
+        except (OSError, subprocess.SubprocessError) as error:
+            raise LifecycleError(
+                "systemctl_failed", f"{' '.join(command)} failed: {error}"
+            ) from error
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise LifecycleError(
+                "systemctl_failed",
+                f"{' '.join(command)} failed: {detail}",
+            )
+
+    def _stop_cleanup_timer(self) -> None:
+        try:
+            self._run_command(
+                ["systemctl", "--user", "stop", "mango-overlay-cleanup.timer"]
+            )
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def _unit_paths(self) -> tuple[Path, ...]:
         return (

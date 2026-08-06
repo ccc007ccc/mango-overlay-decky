@@ -53,11 +53,7 @@ class Plugin:
             )
             return
         try:
-            token = await asyncio.to_thread(
-                manager.mark_pending_uninstall,
-                plugin_root,
-                generation,
-            )
+            token = manager.mark_pending_uninstall(plugin_root, generation)
         except LifecycleError as error:
             if error.code in {"not_installed", "stale_generation"}:
                 decky.logger.info(

@@ -128,27 +128,23 @@ Recorder 保留视频，CSS Loader 保留主题和 symlink，Framegen 保留游�
 
 这种策略对用户产物通常正确，但对安全敏感、特权或系统集成资源可能造成孤儿：例如 setuid bwrap、副作用仍生效的 systemd 服务、Steam 代理配置或系统 drop-in。因此每个插件必须有自己的明确所有权清单，不能依赖 Loader。
 
-## 本项目当前实现差距
+## 本项目发现与修复状态
 
-以下检查基于本项目当前公开提交 [`3ade79a3b47385b544bd1bb8473cfd69df8624c0`](https://github.com/ccc007ccc/mango-overlay-decky/tree/3ade79a3b47385b544bd1bb8473cfd69df8624c0) 和 2026-08-06 的 SteamOS 实机日志。
+以下实机发现基于公开提交 [`3ade79a3b47385b544bd1bb8473cfd69df8624c0`](https://github.com/ccc007ccc/mango-overlay-decky/tree/3ade79a3b47385b544bd1bb8473cfd69df8624c0)。对应修复已经完成离线回归，但真实 Decky 更新与卸载仍需用新包复测。
 
-### 1. `_uninstall()` 在真实 Loader 的五秒期限内没有可靠返回
+### 1. `_uninstall()` 的五秒超时：已修复，待实机确认
 
-插件 `_uninstall()` 通过 `asyncio.to_thread()` 等待同步的 `mark_pending_uninstall()` 完成，只有返回后才记录 `verification armed`；参见 [`plugin/main.py` L46-L68](https://github.com/ccc007ccc/mango-overlay-decky/blob/3ade79a3b47385b544bd1bb8473cfd69df8624c0/plugin/main.py#L46-L68)。`mark_pending_uninstall()` 写 pending record 后又同步执行 `systemctl start` cleanup timer 和 oneshot service；参见 [`lifecycle.py` L430-L463](https://github.com/ccc007ccc/mango-overlay-decky/blob/3ade79a3b47385b544bd1bb8473cfd69df8624c0/plugin/py_modules/mango_overlay_decky/lifecycle.py#L430-L463)。
+旧实现通过 `asyncio.to_thread()` 等待 `mark_pending_uninstall()`，而后者在持有生命周期锁期间同步启动 cleanup oneshot。2026-08-06 21:33 的 Decky `v3.2.8-pre1` 实机日志显示：21:33:00.604 已进入 `_uninstall()`，cleanup service 曾启动并因旧插件目录仍存在而返回 `false`，但回调始终没有记录 `verification armed`；21:33:05 Loader 对仍未退出的后端发送 SIGKILL。该反馈环明确复现了“pending 已交接但回调没有在 Loader 期限内返回”的用户症状。
 
-2026-08-06 21:33 的 Decky `v3.2.8-pre1` 实机卸载日志显示：21:33:00.604 已进入 Mango Overlay 的 `_uninstall()`；21:33:01 cleanup service 已启动并完成一次检查，因为旧插件目录仍存在而返回 `false`，这表明 pending record 很可能已经落盘且外部 finalizer 至少启动过一次。但日志始终没有出现 `Mango Overlay uninstall verification armed`；21:33:05 Loader 报告后端在停止请求五秒后仍存活并发送 SIGKILL，随后删除插件目录。可以确定的故障是 `_uninstall()` 的 handoff/回调没有在 Loader 期限内干净返回，而不是 pending 或 finalizer 完全没有启动。不能先讨论把 60 秒改成几秒而忽略这个前置故障。
+当前实现让 `_uninstall()` 在事件循环线程完成小型原子 pending 落盘，随后只执行一秒上限的 `systemctl --user --no-block restart mango-overlay-cleanup.timer`。它不再同步启动或等待 cleanup service。针对性测试会让同步 cleanup service 模拟阻塞 0.5 秒，并要求 pending handoff 在 0.25 秒内返回；完整插件测试当前为 53 项通过。
 
-修正方向应是让 `_uninstall()` 的同步关键路径只做一次很小、可验证的原子落盘；当前同步 `systemctl` / `asyncio.to_thread()` 路径需要移出该关键路径，启动 finalizer 必须非阻塞，且不能等待 systemd oneshot 完成。现有证据还不足以把五秒阻塞动态归因到某一个具体调用。需要增加一个严格低于 Loader 五秒上限、最好远低于一秒的回调测试，并以回调成功返回、pending record 和外部 finalizer 三项证据共同验收。
+### 2. cleanup timer 的空闲唤醒：已修复
 
-### 2. cleanup timer 当前被永久启用
+旧实现把 timer 与 broker socket 一起 `enable --now`，没有 pending 时也每分钟运行。当前 unit 使用 `OnActiveSec=3s`、`OnUnitActiveSec=5s` 和 `AccuracySec=500ms`；安装时只 `enable` 作为用户管理器重启后的遗留 pending 恢复保险，不立即启动。只有 `_uninstall()` 写入 pending 后才非阻塞重启 timer；替代版本激活、pending 不存在或 generation 已失效时立即停止。因此正常运行不再周期执行 cleanup service。
 
-项目激活集成时把 `mango-overlay-cleanup.timer` 与 broker socket 一起永久 `enable --now`；参见 [`lifecycle.py` L857-L864](https://github.com/ccc007ccc/mango-overlay-decky/blob/3ade79a3b47385b544bd1bb8473cfd69df8624c0/plugin/py_modules/mango_overlay_decky/lifecycle.py#L857-L864)。替代版本成功激活时只删除 transaction 和 pending 文件，没有停止或禁用 timer；参见 [`lifecycle.py` L425-L427](https://github.com/ccc007ccc/mango-overlay-decky/blob/3ade79a3b47385b544bd1bb8473cfd69df8624c0/plugin/py_modules/mango_overlay_decky/lifecycle.py#L425-L427)。结果是没有任何待卸载事务时，cleanup service 仍按分钟被唤醒。
+### 3. Loader 保留目录：已纳入精确清理
 
-cleanup timer 应只在 pending uninstall 存在期间启用。新版本激活并取消 pending 时应立即 `disable --now`；正常安装、重载和长期运行不应保留周期性 cleanup 唤醒。若使用短 one-shot finalizer，则可以完全避免常驻 timer，只保留开机恢复未完成 pending 的机制。
-
-### 3. 最终清理遗漏了 Loader 保留目录
-
-当前 final cleanup 的 `cleanup_roots` 只包括项目自己的 `~/.local/share`、`~/.local/libexec`、`~/.config`、`~/.cache` 和 `~/.local/state` 路径；参见 [`lifecycle.py` L482-L516](https://github.com/ccc007ccc/mango-overlay-decky/blob/3ade79a3b47385b544bd1bb8473cfd69df8624c0/plugin/py_modules/mango_overlay_decky/lifecycle.py#L482-L516)。但 Decky Loader 明确不会删除并会长期保留：
+最终清理现在除项目自己的 `~/.local/share`、`~/.local/libexec`、`~/.config`、`~/.cache` 和 `~/.local/state` 外，还精确验证并删除：
 
 ```text
 ~/homebrew/settings/mango-overlay-decky/
@@ -156,7 +152,11 @@ cleanup timer 应只在 pending uninstall 存在期间启用。新版本激活�
 ~/homebrew/logs/mango-overlay-decky/
 ```
 
-本项目没有需要卸载后保留的业务数据，所以真实最终卸载应把这三个**精确、验证所有权且不跟随符号链接**的目录一并清理。不能递归清理 `~/homebrew/settings`、`data` 或 `logs` 的父目录。
+回归测试同时创建相邻插件数据，确认不会递归删除 `~/homebrew/settings`、`data`、`logs` 父目录或其他插件目录。
+
+### 4. 更新目录竞态与旧记录兼容：已覆盖离线回归
+
+pending 记录保存旧插件目录的 device/inode。finalizer 会区分原目录仍存在、同路径半解压而身份不明、同标识替代插件已经出现和插件确实缺失；扫描限制为旧路径父目录的 256 个条目，并拒绝不安全的插件根目录。没有 device/inode 字段的旧 pending 记录仍可读取：旧目录存在时保守等待，目录消失后再进行同标识扫描和最终清理。
 
 ## 对 Mango Overlay Decky 的建议
 
@@ -198,11 +198,11 @@ finalizer
   -> 仍然缺失：立即执行最终卸载
 ```
 
-当前 Loader 在 `uninstall_plugin()` 返回后同步解压内存中的 zip，因此成功更新时新插件目录通常会很快重新出现。把当前 60 秒 grace 缩短到约 2–5 秒只能作为**候选设计**，不是 Decky API 保证；必须先修复上述五秒 SIGKILL 问题，再用连续更新、慢存储、后端延迟启动和损坏包进行实机压力测试，测试通过后才能确定窗口。另一选择是使用事件驱动或短周期 one-shot 检查，而不是常驻的一分钟 timer。
+当前 Loader 在 `uninstall_plugin()` 返回后同步解压内存中的 zip，因此成功更新时新插件目录通常会很快重新出现。实现已选用 3 秒 grace 和 5 秒重试，并通过原目录 identity、半解压目录和同标识扫描降低误清理风险；这仍不是 Decky API 保证，必须用连续更新、慢启动和损坏包进行实机压力测试后才能视为发布验收完成。
 
-finalizer 不应只相信旧目录名；应在 Decky plugins 根目录中解析有界、受验证的 `plugin.json`，按插件标识确认替代版本，以兼容未来包顶层目录名变化。清理仍需幂等、拒绝符号链接、只删除所有权清单中的路径，并在重启后继续完成中断的最终卸载。
+当前 finalizer 不只相信旧目录名；它会在 Decky plugins 根目录中解析有界、受验证的 `plugin.json`，按插件标识确认替代版本，以兼容未来包顶层目录名变化。清理仍需保持幂等、拒绝符号链接、只删除所有权清单中的路径，并在重启后继续完成中断的最终卸载。
 
-### 建议的验收条件
+### 剩余验收条件
 
 1. **真实卸载延迟：** 点击 Decky 卸载后 5 秒内恢复系统 MangoApp、停止项目服务并删除项目所属文件。
 2. **正常更新：** 旧版本 `_uninstall()` 被调用，但新插件目录出现后 finalizer 不清理；新版本验证并原子激活，Steam 统计和 provider 画布保持独立。
@@ -210,6 +210,8 @@ finalizer 不应只相信旧目录名；应在 Decky plugins 根目录中解析�
 4. **损坏更新：** Loader 删除旧插件后散列失败、插件保持缺失，finalizer 最终恢复系统状态且不留下孤儿服务。
 5. **重载与禁用：** 只执行 `_unload()`，不产生 pending uninstall，不改变 drop-in、活动 runtime 或用户总开关。
 6. **finalizer 中断：** 清理中断或设备重启后能根据 token/事务记录安全重试。
+
+其中重载/禁用、目录身份、旧 pending、扫描上限、精确清理和非阻塞 handoff 已有自动化回归；1–4 仍需要真实 Decky Loader 和 SteamOS 会话证据。
 
 ## 最终判断
 

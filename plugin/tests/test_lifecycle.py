@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import tempfile
+import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +18,10 @@ from mango_overlay_decky.lifecycle import (
     LifecycleError,
     LifecycleManager,
     LifecyclePaths,
+    MAX_PLUGIN_DIRECTORIES,
+    UNINSTALL_GRACE_SECONDS,
     _default_run,
+    _default_run_quick,
     _plugin_directory_is_trusted,
     _plugin_file_is_trusted,
 )
@@ -38,6 +42,7 @@ class FakeSystemctl:
         self.fail_mango_restarts = 0
         self.fail_integration_enables = 0
         self.crash_on_broker_restart = False
+        self.cleanup_service_delay = 0.0
         self.cleanup_started_while_locked = False
         self.lock_path = lock_path
 
@@ -72,6 +77,7 @@ class FakeSystemctl:
         if call[-2:] == ("restart", "mango-overlay-test-provider.service"):
             self.test_provider_active = True
         if call[-2:] == ("start", "mango-overlay-cleanup.service"):
+            time.sleep(self.cleanup_service_delay)
             descriptor = os.open(self.lock_path, os.O_RDWR)
             try:
                 try:
@@ -149,6 +155,7 @@ class LifecycleTests(unittest.TestCase):
         self.manager = LifecycleManager(
             self.paths,
             run_command=self.systemctl,
+            run_quick_command=self.systemctl,
             verify_runtime=lambda path, version: self.verified.append((path, version)),
             now=lambda: self.now,
             token_factory=lambda: "a" * 32,
@@ -178,6 +185,21 @@ class LifecycleTests(unittest.TestCase):
             environment["DBUS_SESSION_BUS_ADDRESS"],
             "unix:path=/run/user/1000/bus",
         )
+
+    def test_quick_runner_uses_a_one_second_timeout(self) -> None:
+        with patch("mango_overlay_decky.lifecycle.subprocess.run") as run:
+            run.return_value = CommandResult()
+            _default_run_quick(
+                [
+                    "systemctl",
+                    "--user",
+                    "--no-block",
+                    "restart",
+                    "mango-overlay-cleanup.timer",
+                ]
+            )
+
+        self.assertEqual(run.call_args.kwargs["timeout"], 1)
 
     def test_decky_root_owned_plugin_directory_is_trusted_but_not_writable(self) -> None:
         root_owned = SimpleNamespace(st_mode=stat.S_IFDIR | 0o755, st_uid=0)
@@ -217,6 +239,32 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(self.paths.mangoapp_dropin.is_file())
         self.assertNotIn(
             ("systemctl", "--user", "restart", "gamescope-mangoapp.service"),
+            self.systemctl.commands,
+        )
+        timer = (
+            self.paths.systemd_user_root / "mango-overlay-cleanup.timer"
+        ).read_text(encoding="utf-8")
+        self.assertIn("OnActiveSec=3s", timer)
+        self.assertIn("OnUnitActiveSec=5s", timer)
+        self.assertNotIn("OnBootSec", timer)
+        self.assertIn(
+            (
+                "systemctl",
+                "--user",
+                "enable",
+                "mango-overlay-cleanup.timer",
+            ),
+            self.systemctl.commands,
+        )
+        self.assertNotIn(
+            (
+                "systemctl",
+                "--user",
+                "enable",
+                "--now",
+                "mango-overlayd.socket",
+                "mango-overlay-cleanup.timer",
+            ),
             self.systemctl.commands,
         )
 
@@ -387,22 +435,160 @@ class LifecycleTests(unittest.TestCase):
 
         self.assertFalse(self.paths.pending_uninstall_file.exists())
         self.assertFalse(self.manager.finalize_pending_uninstall())
+        self.assertIn(
+            (
+                "systemctl",
+                "--user",
+                "stop",
+                "mango-overlay-cleanup.timer",
+            ),
+            self.systemctl.commands,
+        )
+
+    def test_mark_pending_uninstall_does_not_wait_for_cleanup_service(self) -> None:
+        plugin = make_plugin(self.root, "0.1.0", "first")
+        self.manager.activate(plugin, "0.1.0", "generation-one")
+        self.systemctl.cleanup_service_delay = 0.5
+
+        started = time.monotonic()
+        self.manager.mark_pending_uninstall(plugin, "generation-one")
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.25)
+        self.assertIn(
+            (
+                "systemctl",
+                "--user",
+                "--no-block",
+                "restart",
+                "mango-overlay-cleanup.timer",
+            ),
+            self.systemctl.commands,
+        )
+        self.assertNotIn(
+            (
+                "systemctl",
+                "--user",
+                "start",
+                "mango-overlay-cleanup.service",
+            ),
+            self.systemctl.commands,
+        )
+
+    def test_replacement_plugin_cancels_pending_before_backend_activation(self) -> None:
+        plugin = make_plugin(self.root, "0.1.0", "first")
+        expected = self.manager.activate(plugin, "0.1.0", "generation-one")
+        token = self.manager.mark_pending_uninstall(plugin, "generation-one")
+        shutil.rmtree(plugin)
+        make_plugin(self.root, "0.2.0", "replacement")
+        self.now += UNINSTALL_GRACE_SECONDS + 0.1
+
+        self.assertFalse(self.manager.finalize_pending_uninstall(token))
+        self.assertEqual(self.manager.status(), expected)
+        self.assertFalse(self.paths.pending_uninstall_file.exists())
+
+    def test_partial_replacement_at_the_same_path_is_ambiguous(self) -> None:
+        plugin = make_plugin(self.root, "0.1.0", "first")
+        expected = self.manager.activate(plugin, "0.1.0", "generation-one")
+        token = self.manager.mark_pending_uninstall(plugin, "generation-one")
+        shutil.rmtree(plugin)
+        plugin.mkdir()
+        self.now += UNINSTALL_GRACE_SECONDS + 0.1
+
+        self.assertFalse(self.manager.finalize_pending_uninstall(token))
+        self.assertEqual(self.manager.status(), expected)
+        self.assertTrue(self.paths.pending_uninstall_file.exists())
+        self.assertTrue(self.paths.mangoapp_dropin.exists())
+
+    def test_valid_replacement_at_the_same_path_cancels_pending(self) -> None:
+        plugin = make_plugin(self.root, "0.1.0", "first")
+        expected = self.manager.activate(plugin, "0.1.0", "generation-one")
+        token = self.manager.mark_pending_uninstall(plugin, "generation-one")
+        replacement = make_plugin(self.root, "0.2.0", "replacement")
+        shutil.rmtree(plugin)
+        replacement.rename(plugin)
+
+        self.assertFalse(self.manager.finalize_pending_uninstall(token))
+        self.assertEqual(self.manager.status(), expected)
+        self.assertFalse(self.paths.pending_uninstall_file.exists())
+
+    def test_legacy_pending_record_finalizes_after_the_old_directory_is_gone(
+        self,
+    ) -> None:
+        plugin = make_plugin(self.root, "0.1.0", "first")
+        self.manager.activate(plugin, "0.1.0", "generation-one")
+        token = self.manager.mark_pending_uninstall(plugin, "generation-one")
+        pending = json.loads(
+            self.paths.pending_uninstall_file.read_text(encoding="utf-8")
+        )
+        pending.pop("plugin_device")
+        pending.pop("plugin_inode")
+        self.manager._write_json(self.paths.pending_uninstall_file, pending)
+
+        self.assertFalse(self.manager.finalize_pending_uninstall(token))
+        shutil.rmtree(plugin)
+        self.now += UNINSTALL_GRACE_SECONDS + 0.1
+
+        self.assertTrue(self.manager.finalize_pending_uninstall(token))
+
+    def test_untrusted_plugins_root_blocks_final_cleanup(self) -> None:
+        plugin = make_plugin(self.root, "0.1.0", "first")
+        self.manager.activate(plugin, "0.1.0", "generation-one")
+        token = self.manager.mark_pending_uninstall(plugin, "generation-one")
+        shutil.rmtree(plugin)
+        self.root.chmod(0o777)
+        self.now += UNINSTALL_GRACE_SECONDS + 0.1
+
+        with self.assertRaisesRegex(LifecycleError, "plugins root is unsafe"):
+            self.manager.finalize_pending_uninstall(token)
+
+        self.assertTrue(self.paths.pending_uninstall_file.exists())
+        self.assertTrue(self.paths.mangoapp_dropin.exists())
+
+    def test_replacement_scan_is_bounded(self) -> None:
+        plugin = make_plugin(self.root, "0.1.0", "first")
+        self.manager.activate(plugin, "0.1.0", "generation-one")
+        token = self.manager.mark_pending_uninstall(plugin, "generation-one")
+        shutil.rmtree(plugin)
+        for index in range(MAX_PLUGIN_DIRECTORIES):
+            (self.root / f"unrelated-{index}").mkdir()
+        self.now += UNINSTALL_GRACE_SECONDS + 0.1
+
+        with self.assertRaisesRegex(LifecycleError, "too many entries"):
+            self.manager.finalize_pending_uninstall(token)
+
+        self.assertTrue(self.paths.pending_uninstall_file.exists())
+        self.assertTrue(self.paths.mangoapp_dropin.exists())
 
     def test_final_uninstall_requires_grace_and_plugin_absence(self) -> None:
         plugin = make_plugin(self.root, "0.1.0", "first")
         self.manager.activate(plugin, "0.1.0", "generation-one")
+        decky_roots = (
+            self.home / "homebrew/settings/mango-overlay-decky",
+            self.home / "homebrew/data/mango-overlay-decky",
+            self.home / "homebrew/logs/mango-overlay-decky",
+        )
+        for root in decky_roots:
+            root.mkdir(parents=True)
+            (root / "owned").write_text("owned", encoding="utf-8")
+        sibling = self.home / "homebrew/settings/another-plugin/keep"
+        sibling.parent.mkdir(parents=True)
+        sibling.write_text("keep", encoding="utf-8")
         token = self.manager.mark_pending_uninstall(plugin, "generation-one")
         self.assertFalse(self.manager.finalize_pending_uninstall(token))
 
         shutil.rmtree(plugin)
         self.assertFalse(self.manager.finalize_pending_uninstall(token))
-        self.now += 61.0
+        self.now += UNINSTALL_GRACE_SECONDS + 0.1
         self.systemctl.gamescope_active = True
 
         self.assertTrue(self.manager.finalize_pending_uninstall(token))
         self.assertFalse(self.paths.mangoapp_dropin.exists())
         self.assertFalse(self.paths.data_root.exists())
         self.assertFalse(self.paths.libexec_root.exists())
+        for root in decky_roots:
+            self.assertFalse(root.exists())
+        self.assertEqual(sibling.read_text(encoding="utf-8"), "keep")
         self.assertIn(
             ("systemctl", "--user", "restart", "gamescope-mangoapp.service"),
             self.systemctl.commands,
@@ -525,7 +711,7 @@ class LifecycleTests(unittest.TestCase):
         self.manager.activate(plugin, "0.1.0", "generation-one")
         token = self.manager.mark_pending_uninstall(plugin, "generation-one")
         shutil.rmtree(plugin)
-        self.now += 61.0
+        self.now += UNINSTALL_GRACE_SECONDS + 0.1
         self.systemctl.gamescope_active = True
         external = self.root / "external"
         external.write_text("keep", encoding="utf-8")
