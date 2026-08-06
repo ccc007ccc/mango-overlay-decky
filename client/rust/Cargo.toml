@@ -1,0 +1,12 @@
+[package]
+name = "mango-overlay"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Rust provider SDK for Mango Overlay Decky"
+
+[lib]
+name = "mango_overlay"
+path = "src/lib.rs"
+
+[dependencies]

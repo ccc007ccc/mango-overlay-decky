@@ -163,7 +163,13 @@ void init_cpu_stats(overlay_params& params);
 void check_keybinds(overlay_params& params);
 void init_system_info(void);
 void check_for_vkbasalt_and_gamemode();
-void create_fonts(ImFontAtlas* font_atlas, const overlay_params& params, ImFont*& small_font, ImFont*& text_font, ImFont*& secondary_font);
+void create_fonts(
+    ImFontAtlas* font_atlas,
+    const overlay_params& params,
+    ImFont*& small_font,
+    ImFont*& text_font,
+    ImFont*& secondary_font,
+    ImFont** high_density_text_font = nullptr);
 void right_aligned_text(ImVec4& col, float off_x, const char *fmt, ...);
 void center_text(const std::string& text);
 ImVec4 change_on_load_temp(LOAD_DATA& data, unsigned current);

@@ -180,6 +180,15 @@ link_args = cc.get_supported_link_arguments(['-Wl,-Bsymbolic-functions', '-Wl,-z
 # meson fails to check version-script so just force add
 link_args += '-Wl,--version-script,@0@'.format(join_paths(meson.current_source_dir(), 'mangohud.version'))
 
+mango_overlay_desktop_cpp_args = []
+mango_overlay_vulkan_dep = null_dep
+mango_overlay_opengl_deps = []
+if get_option('mango_overlay_decky').enabled()
+  mango_overlay_desktop_cpp_args += '-DMANGO_OVERLAY_DECKY'
+  mango_overlay_vulkan_dep = renderer_imgui_dep
+  mango_overlay_opengl_deps = [renderer_imgui_dep, renderer_opengl_texture_dep]
+endif
+
 mangohud_static_lib = static_library(
   'MangoHud',
   mangohud_version,
@@ -196,7 +205,8 @@ mangohud_static_lib = static_library(
     ],
   cpp_args : [
     pre_args,
-    vulkan_wsi_args
+    vulkan_wsi_args,
+    mango_overlay_desktop_cpp_args
     ],
   gnu_symbol_visibility : 'hidden',
   dependencies : [
@@ -210,7 +220,8 @@ mangohud_static_lib = static_library(
     dep_pthread,
     dep_vulkan,
     windows_deps,
-    implot_dep],
+    implot_dep,
+    mango_overlay_vulkan_dep],
   include_directories : [inc_common],
   link_args : link_args,
   install_dir : libdir_mangohud,
@@ -222,6 +233,7 @@ mangohud_shared_lib = shared_library(
   objects: mangohud_static_lib.extract_all_objects(),
   link_with: mangohud_static_lib,
   link_args : link_args,
+  dependencies: mango_overlay_vulkan_dep,
   install_dir : libdir_mangohud,
   install: true
 )
@@ -238,7 +250,8 @@ mangohud_opengl_shared_lib = shared_library(
     ],
   cpp_args : [
     pre_args,
-    vulkan_wsi_args
+    vulkan_wsi_args,
+    mango_overlay_desktop_cpp_args
     ],
   dependencies : [
     mangohud_version_dep,
@@ -251,7 +264,8 @@ mangohud_opengl_shared_lib = shared_library(
     dep_pthread,
     dep_vulkan,
     windows_deps,
-    implot_dep],
+    implot_dep,
+    mango_overlay_opengl_deps],
   include_directories : [inc_common],
   link_args : link_args,
   link_with: mangohud_static_lib,
@@ -264,6 +278,12 @@ if get_option('mangoapp')
     error('mangoapp also needs \'with_x11\'')
   endif
   pre_args += '-DMANGOAPP'
+  mangoapp_overlay_dep = null_dep
+  mangoapp_overlay_cpp_args = []
+  if get_option('mango_overlay_decky').enabled()
+    mangoapp_overlay_dep = [renderer_imgui_dep, renderer_opengl_texture_dep]
+    mangoapp_overlay_cpp_args += '-DMANGO_OVERLAY_DECKY'
+  endif
   mangoapp = executable(
     'mangoapp',
     files(
@@ -275,7 +295,8 @@ if get_option('mangoapp')
     ],
     cpp_args : [
       pre_args,
-      vulkan_wsi_args
+      vulkan_wsi_args,
+      mangoapp_overlay_cpp_args
     ],
     gnu_symbol_visibility : 'hidden',
     dependencies : [
@@ -287,7 +308,8 @@ if get_option('mangoapp')
       dep_x11,
       dep_wayland_client,
       glfw3_dep,
-      implot_dep
+      implot_dep,
+      mangoapp_overlay_dep
     ],
     include_directories : [inc_common],
     install_tag : 'mangoapp',
@@ -295,6 +317,14 @@ if get_option('mangoapp')
     link_args : link_args,
     install : true
   )
+  if get_option('tests').enabled() and get_option('mango_overlay_decky').enabled()
+    test(
+      'mango overlay MangoApp self test',
+      mangoapp,
+      args: ['--mango-overlay-self-test'],
+      timeout: 5,
+    )
+  endif
 endif
 
 if get_option('mangohudctl')

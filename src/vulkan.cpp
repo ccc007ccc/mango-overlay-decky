@@ -33,8 +33,12 @@
 #include <vector>
 #include <list>
 #include <array>
+#include <cstdint>
 #include <iomanip>
+#include <limits>
+#include <memory>
 #include <sstream>
+#include <type_traits>
 #include <inttypes.h>
 #include <spdlog/spdlog.h>
 #include <imgui.h>
@@ -63,7 +67,54 @@
 #include "imgui_utils.h"
 #include "fps_limiter.h"
 
+#ifdef MANGO_OVERLAY_DECKY
+#include "mango_overlay/renderer/canvas.hpp"
+#include "mango_overlay/renderer/imgui_scene.hpp"
+#include "mango_overlay/renderer/scene_client.hpp"
+#endif
+
 using namespace std;
+
+namespace {
+
+template <typename Handle>
+std::uint64_t vk_handle_to_u64(Handle handle)
+{
+   static_assert(
+      std::is_pointer_v<Handle> || std::is_integral_v<Handle>,
+      "Vulkan handles must be pointer or integer types");
+   static_assert(
+      sizeof(Handle) <= sizeof(std::uint64_t),
+      "Vulkan handle does not fit in a 64-bit texture identifier");
+   if constexpr (std::is_pointer_v<Handle>) {
+      return static_cast<std::uint64_t>(
+         reinterpret_cast<std::uintptr_t>(handle));
+   } else {
+      return static_cast<std::uint64_t>(handle);
+   }
+}
+
+template <typename Handle>
+Handle u64_to_vk_handle(std::uint64_t value)
+{
+   static_assert(
+      std::is_pointer_v<Handle> || std::is_integral_v<Handle>,
+      "Vulkan handles must be pointer or integer types");
+   static_assert(
+      sizeof(Handle) <= sizeof(std::uint64_t),
+      "Vulkan handle does not fit in a 64-bit texture identifier");
+   if constexpr (std::is_pointer_v<Handle>) {
+      return reinterpret_cast<Handle>(static_cast<std::uintptr_t>(value));
+   } else {
+      return static_cast<Handle>(value);
+   }
+}
+
+static_assert(
+   sizeof(ImTextureID) >= sizeof(VkDescriptorSet),
+   "ImTextureID must hold a Vulkan descriptor set");
+
+} // namespace
 
 float offset_x, offset_y, hudSpacing;
 int hudFirstRow, hudSecondRow;
@@ -87,6 +138,9 @@ struct instance_data {
    notify_thread notifier;
    int control_client;
    uint32_t applicationVersion;
+#ifdef MANGO_OVERLAY_DECKY
+   std::unique_ptr<mango_overlay::renderer::SceneClient> provider_scene_client;
+#endif
 };
 
 /* Mapped from VkDevice */
@@ -144,6 +198,10 @@ struct overlay_draw {
    VkDeviceSize index_buffer_size;
 };
 
+#ifdef MANGO_OVERLAY_DECKY
+class VulkanTextureBackend;
+#endif
+
 /* Mapped from VkSwapchainKHR */
 struct swapchain_data {
    struct device_data *device;
@@ -184,6 +242,11 @@ struct swapchain_data {
    ImVec2 window_size;
 
    struct swapchain_stats sw_stats;
+#ifdef MANGO_OVERLAY_DECKY
+   std::unique_ptr<mango_overlay::renderer::ImGuiSceneRenderer> provider_scene_renderer;
+   VulkanTextureBackend* provider_texture_backend = nullptr;
+   ImFont* provider_scene_font = nullptr;
+#endif
 };
 
 // single global lock, for simplicity
@@ -405,6 +468,8 @@ static struct swapchain_data *new_swapchain_data(VkSwapchainKHR swapchain,
    data->swapchain = swapchain;
    data->window_size = ImVec2(instance_data->params.width, instance_data->params.height);
    data->font_atlas = IM_NEW(ImFontAtlas);
+#ifdef MANGO_OVERLAY_DECKY
+#endif
    map_object(HKEY(data->swapchain), data);
    return data;
 }
@@ -480,12 +545,40 @@ static void snapshot_swapchain_frame(struct swapchain_data *data)
 #endif
 }
 
-static void compute_swapchain_display(struct swapchain_data *data)
+#ifdef MANGO_OVERLAY_DECKY
+static std::shared_ptr<const mango_overlay::scene::SceneSnapshot>
+visible_provider_snapshot(struct instance_data *instance_data)
+{
+   if (!instance_data->provider_scene_client
+       || !instance_data->provider_scene_client->connected()) {
+      return {};
+   }
+   auto snapshot = instance_data->provider_scene_client->snapshot();
+   if (!mango_overlay::renderer::snapshot_has_visible_provider(
+          *snapshot, false)) {
+      return {};
+   }
+   return snapshot;
+}
+#endif
+
+static void compute_swapchain_display(
+   struct swapchain_data *data
+#ifdef MANGO_OVERLAY_DECKY
+   , const std::shared_ptr<const mango_overlay::scene::SceneSnapshot>&
+        provider_snapshot
+#endif
+)
 {
    struct device_data *device_data = data->device;
    struct instance_data *instance_data = device_data->instance;
 
-   if (get_params()->no_display)
+   bool provider_visible = false;
+#ifdef MANGO_OVERLAY_DECKY
+   provider_visible = provider_snapshot != nullptr;
+#endif
+
+   if (get_params()->no_display && !provider_visible)
       return;
 
    auto saved_imgui_context = get_current_imgui_contexts();
@@ -500,6 +593,15 @@ static void compute_swapchain_display(struct swapchain_data *data)
       overlay_new_frame(instance_data->params);
       position_layer(data->sw_stats, instance_data->params, data->window_size);
       render_imgui(data->sw_stats, instance_data->params, data->window_size, true);
+#ifdef MANGO_OVERLAY_DECKY
+      if (provider_visible && data->provider_scene_renderer) {
+         data->provider_scene_renderer->draw(
+            *provider_snapshot,
+            static_cast<float>(data->width),
+            static_cast<float>(data->height),
+            false);
+      }
+#endif
       overlay_end_frame();
    }
    ImGui::EndFrame();
@@ -686,6 +788,16 @@ static void create_image(struct swapchain_data *data,
    view_info.image = image;
    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
    view_info.format = format;
+   view_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+   view_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+   view_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+   view_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+   if (format == VK_FORMAT_R8_UNORM) {
+      view_info.components.r = VK_COMPONENT_SWIZZLE_ONE;
+      view_info.components.g = VK_COMPONENT_SWIZZLE_ONE;
+      view_info.components.b = VK_COMPONENT_SWIZZLE_ONE;
+      view_info.components.a = VK_COMPONENT_SWIZZLE_R;
+   }
    view_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
    view_info.subresourceRange.levelCount = 1;
    view_info.subresourceRange.layerCount = 1;
@@ -720,6 +832,162 @@ static VkDescriptorSet create_image_with_desc(struct swapchain_data *data,
    return descriptor_set;
 }
 
+#ifdef MANGO_OVERLAY_DECKY
+class VulkanTextureBackend final : public mango_overlay::renderer::TextureBackend {
+public:
+   explicit VulkanTextureBackend(struct swapchain_data *data)
+      : data_(data)
+   {
+   }
+
+   ~VulkanTextureBackend() override
+   {
+      struct device_data *device_data = data_->device;
+      device_data->vtable.DeviceWaitIdle(device_data->device);
+      for (auto& entry : textures_)
+         release(*entry.second);
+      for (auto& texture : retired_)
+         release(*texture);
+   }
+
+   mango_overlay::renderer::TextureHandle upload_rgba(
+      std::uint32_t width,
+      std::uint32_t height,
+      const std::uint8_t* rgba,
+      std::size_t size) override
+   {
+      if (width == 0 || height == 0 || rgba == nullptr
+          || width > std::numeric_limits<std::size_t>::max() / height / 4
+          || size != static_cast<std::size_t>(width) * height * 4) {
+         return 0;
+      }
+
+      struct device_data *device_data = data_->device;
+      auto texture = std::make_unique<Texture>();
+
+      VkDescriptorSetAllocateInfo alloc_info = {};
+      alloc_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+      alloc_info.descriptorPool = data_->descriptor_pool;
+      alloc_info.descriptorSetCount = 1;
+      alloc_info.pSetLayouts = &data_->descriptor_layout;
+      if (device_data->vtable.AllocateDescriptorSets(
+             device_data->device, &alloc_info, &texture->descriptor_set)
+          != VK_SUCCESS) {
+         return 0;
+      }
+
+      create_image(
+         data_,
+         texture->descriptor_set,
+         width,
+         height,
+         VK_FORMAT_R8G8B8A8_UNORM,
+         texture->image,
+         texture->image_memory,
+         texture->image_view);
+      texture->width = width;
+      texture->height = height;
+      texture->pixels.assign(rgba, rgba + size);
+
+      const auto handle = static_cast<mango_overlay::renderer::TextureHandle>(
+         vk_handle_to_u64(texture->descriptor_set));
+      if (handle == 0) {
+         release(*texture);
+         return 0;
+      }
+      textures_.emplace(handle, std::move(texture));
+      return handle;
+   }
+
+   void destroy(mango_overlay::renderer::TextureHandle handle) override
+   {
+      const auto texture = textures_.find(handle);
+      if (texture == textures_.end())
+         return;
+      retired_.push_back(std::move(texture->second));
+      textures_.erase(texture);
+   }
+
+   void record_pending_uploads(VkCommandBuffer command_buffer)
+   {
+      collect_retired();
+      for (auto& entry : textures_) {
+         Texture& texture = *entry.second;
+         if (texture.pixels.empty())
+            continue;
+         upload_image_data(
+            data_->device,
+            command_buffer,
+            texture.pixels.data(),
+            texture.pixels.size(),
+            texture.width,
+            texture.height,
+            texture.upload_buffer,
+            texture.upload_memory,
+            texture.image);
+         texture.pixels.clear();
+         texture.pixels.shrink_to_fit();
+      }
+   }
+
+private:
+   struct Texture {
+      VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+      VkImage image = VK_NULL_HANDLE;
+      VkDeviceMemory image_memory = VK_NULL_HANDLE;
+      VkImageView image_view = VK_NULL_HANDLE;
+      VkBuffer upload_buffer = VK_NULL_HANDLE;
+      VkDeviceMemory upload_memory = VK_NULL_HANDLE;
+      std::uint32_t width = 0;
+      std::uint32_t height = 0;
+      std::vector<std::uint8_t> pixels;
+   };
+
+   void collect_retired()
+   {
+      if (retired_.empty())
+         return;
+      struct device_data *device_data = data_->device;
+      device_data->vtable.DeviceWaitIdle(device_data->device);
+      for (auto& texture : retired_)
+         release(*texture);
+      retired_.clear();
+   }
+
+   void release(Texture& texture)
+   {
+      struct device_data *device_data = data_->device;
+      if (texture.upload_buffer != VK_NULL_HANDLE)
+         device_data->vtable.DestroyBuffer(
+            device_data->device, texture.upload_buffer, NULL);
+      if (texture.upload_memory != VK_NULL_HANDLE)
+         device_data->vtable.FreeMemory(
+            device_data->device, texture.upload_memory, NULL);
+      if (texture.image_view != VK_NULL_HANDLE)
+         device_data->vtable.DestroyImageView(
+            device_data->device, texture.image_view, NULL);
+      if (texture.image != VK_NULL_HANDLE)
+         device_data->vtable.DestroyImage(
+            device_data->device, texture.image, NULL);
+      if (texture.image_memory != VK_NULL_HANDLE)
+         device_data->vtable.FreeMemory(
+            device_data->device, texture.image_memory, NULL);
+      if (texture.descriptor_set != VK_NULL_HANDLE)
+         device_data->vtable.FreeDescriptorSets(
+            device_data->device,
+            data_->descriptor_pool,
+            1,
+            &texture.descriptor_set);
+   }
+
+   struct swapchain_data *data_;
+   std::unordered_map<
+      mango_overlay::renderer::TextureHandle,
+      std::unique_ptr<Texture>> textures_;
+   std::vector<std::unique_ptr<Texture>> retired_;
+};
+#endif
+
 static void check_fonts(struct swapchain_data* data)
 {
    struct device_data *device_data = data->device;
@@ -729,8 +997,21 @@ static void check_fonts(struct swapchain_data* data)
    if (params.font_params_hash != data->sw_stats.font_params_hash)
    {
       SPDLOG_DEBUG("Recreating font image");
-      VkDescriptorSet desc_set = (VkDescriptorSet)data->font_atlas->TexID;
+      VkDescriptorSet desc_set = u64_to_vk_handle<VkDescriptorSet>(
+         static_cast<std::uint64_t>(data->font_atlas->TexID));
+#ifdef MANGO_OVERLAY_DECKY
+      create_fonts(
+         data->font_atlas,
+         instance_data->params,
+         data->sw_stats.font_small,
+         data->sw_stats.font_text,
+         data->sw_stats.font_secondary,
+         &data->provider_scene_font);
+      if (data->provider_scene_renderer)
+         data->provider_scene_renderer->set_text_font(data->provider_scene_font);
+#else
       create_fonts(data->font_atlas, instance_data->params, data->sw_stats.font_small, data->sw_stats.font_text, data->sw_stats.font_secondary);
+#endif
       unsigned char* pixels;
       int width, height;
       data->font_atlas->GetTexDataAsAlpha8(&pixels, &width, &height);
@@ -744,7 +1025,8 @@ static void check_fonts(struct swapchain_data* data)
       else
          desc_set = create_image_with_desc(data, width, height, VK_FORMAT_R8_UNORM, data->font_image, data->font_mem, data->font_image_view);
 
-      data->font_atlas->SetTexID((ImTextureID)desc_set);
+      data->font_atlas->SetTexID(
+         static_cast<ImTextureID>(vk_handle_to_u64(desc_set)));
       data->font_uploaded = false;
       data->sw_stats.font_params_hash = params.font_params_hash;
       SPDLOG_DEBUG("Default font tex size: {}x{}px", width, height);
@@ -818,7 +1100,7 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
    ImDrawData* draw_data = ImGui::GetDrawData();
    struct device_data *device_data = data->device;
 
-   if (!draw_data || draw_data->TotalVtxCount == 0 || get_params()->no_display)
+   if (!draw_data || draw_data->TotalVtxCount == 0)
    {
       make_imgui_contexts_current(saved_imgui_context);
       return nullptr;
@@ -841,6 +1123,11 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
    device_data->vtable.BeginCommandBuffer(draw->command_buffer, &buffer_begin_info);
 
    ensure_swapchain_fonts(data, draw->command_buffer);
+#ifdef MANGO_OVERLAY_DECKY
+   if (data->provider_texture_backend)
+      data->provider_texture_backend->record_pending_uploads(
+         draw->command_buffer);
+#endif
 
    /* Bounce the image to display back to color attachment layout for
     * rendering on top of it.
@@ -915,17 +1202,8 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
    device_data->vtable.UnmapMemory(device_data->device, draw->vertex_buffer_mem);
    device_data->vtable.UnmapMemory(device_data->device, draw->index_buffer_mem);
 
-   /* Bind pipeline and descriptor sets */
+   /* Bind pipeline */
    device_data->vtable.CmdBindPipeline(draw->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, data->pipeline);
-
-#if 1 // disable if using >1 font textures
-   VkDescriptorSet desc_set[1] = {
-      //data->descriptor_set
-      reinterpret_cast<VkDescriptorSet>(data->font_atlas->TexID)
-   };
-   device_data->vtable.CmdBindDescriptorSets(draw->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                             data->pipeline_layout, 0, 1, desc_set, 0, NULL);
-#endif
 
    /* Bind vertex & index buffers */
    VkBuffer vertex_buffers[1] = { draw->vertex_buffer };
@@ -981,11 +1259,15 @@ static struct overlay_draw *render_swapchain_display(struct swapchain_data *data
          scissor.extent.width = (uint32_t)(pcmd->ClipRect.z - pcmd->ClipRect.x);
          scissor.extent.height = (uint32_t)(pcmd->ClipRect.w - pcmd->ClipRect.y + 1); // FIXME: Why +1 here?
          device_data->vtable.CmdSetScissor(draw->command_buffer, 0, 1, &scissor);
-#if 0 //enable if using >1 font textures or use texture array
-         VkDescriptorSet desc_set[1] = { (VkDescriptorSet)pcmd->TextureId };
+         const ImTextureID texture_id = pcmd->GetTexID() != 0
+            ? pcmd->GetTexID()
+            : data->font_atlas->TexID;
+         VkDescriptorSet desc_set[1] = {
+            u64_to_vk_handle<VkDescriptorSet>(
+               static_cast<std::uint64_t>(texture_id))
+         };
          device_data->vtable.CmdBindDescriptorSets(draw->command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                                    data->pipeline_layout, 0, 1, desc_set, 0, NULL);
-#endif
          // Draw
          device_data->vtable.CmdDrawIndexed(draw->command_buffer, pcmd->ElemCount, 1, idx_offset, vtx_offset, 0);
 
@@ -1106,9 +1388,9 @@ static void setup_swapchain_data_pipeline(struct swapchain_data *data)
    sampler_info.magFilter = VK_FILTER_LINEAR;
    sampler_info.minFilter = VK_FILTER_LINEAR;
    sampler_info.mipmapMode = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-   sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-   sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT;
-   sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+   sampler_info.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+   sampler_info.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+   sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
    sampler_info.minLod = -1000;
    sampler_info.maxLod = 1000;
    sampler_info.maxAnisotropy = 1.0f;
@@ -1116,12 +1398,14 @@ static void setup_swapchain_data_pipeline(struct swapchain_data *data)
                                               NULL, &data->font_sampler));
 
    /* Descriptor pool */
+   constexpr std::uint32_t maximum_provider_texture_descriptors = 4096;
    VkDescriptorPoolSize sampler_pool_size = {};
    sampler_pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-   sampler_pool_size.descriptorCount = 1;
+   sampler_pool_size.descriptorCount = maximum_provider_texture_descriptors + 1;
    VkDescriptorPoolCreateInfo desc_pool_info = {};
    desc_pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-   desc_pool_info.maxSets = 1;
+   desc_pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+   desc_pool_info.maxSets = maximum_provider_texture_descriptors + 1;
    desc_pool_info.poolSizeCount = 1;
    desc_pool_info.pPoolSizes = &sampler_pool_size;
    VK_CHECK(device_data->vtable.CreateDescriptorPool(device_data->device,
@@ -1464,6 +1748,15 @@ static void setup_swapchain_data(struct swapchain_data *data,
                                                   &cmd_buffer_pool_info,
                                                   NULL, &data->command_pool));
 
+#ifdef MANGO_OVERLAY_DECKY
+   auto texture_backend = std::make_unique<VulkanTextureBackend>(data);
+   data->provider_texture_backend = texture_backend.get();
+   data->provider_scene_renderer
+      = std::make_unique<mango_overlay::renderer::ImGuiSceneRenderer>(
+         std::move(texture_backend));
+   data->provider_scene_renderer->set_text_font(data->provider_scene_font);
+#endif
+
    make_imgui_contexts_current(saved_imgui_contexts);
 }
 
@@ -1482,6 +1775,12 @@ static void shutdown_swapchain_font(struct swapchain_data *data)
 static void shutdown_swapchain_data(struct swapchain_data *data)
 {
    struct device_data *device_data = data->device;
+
+#ifdef MANGO_OVERLAY_DECKY
+   data->provider_scene_renderer.reset();
+   data->provider_texture_backend = nullptr;
+   data->provider_scene_font = nullptr;
+#endif
 
    for (auto draw : data->draws) {
       if (!draw) continue;
@@ -1530,8 +1829,20 @@ static struct overlay_draw *before_present(struct swapchain_data *swapchain_data
 
    snapshot_swapchain_frame(swapchain_data);
 
-   if (swapchain_data->sw_stats.n_frames > 0) {
-      compute_swapchain_display(swapchain_data);
+   bool should_render = swapchain_data->sw_stats.n_frames > 0;
+#ifdef MANGO_OVERLAY_DECKY
+   auto provider_snapshot = visible_provider_snapshot(
+      swapchain_data->device->instance);
+   should_render = should_render || provider_snapshot != nullptr;
+#endif
+
+   if (should_render) {
+      compute_swapchain_display(
+         swapchain_data
+#ifdef MANGO_OVERLAY_DECKY
+         , provider_snapshot
+#endif
+      );
       draw = render_swapchain_display(swapchain_data, present_queue,
                                       wait_semaphores, n_wait_semaphores,
                                       imageIndex);
@@ -2010,6 +2321,11 @@ static VkResult overlay_CreateInstance(
       instance_data->engine = engine;
       instance_data->engineName = engineName;
       instance_data->engineVersion = engineVersion;
+#ifdef MANGO_OVERLAY_DECKY
+      instance_data->provider_scene_client
+         = std::make_unique<mango_overlay::renderer::SceneClient>();
+      instance_data->provider_scene_client->start();
+#endif
    }
 
    instance_data->api_version = pCreateInfo->pApplicationInfo ? pCreateInfo->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;

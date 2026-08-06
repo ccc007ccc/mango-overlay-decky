@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+mangoapp_binary="${MANGO_OVERLAY_MANGOAPP_BINARY:-${repo_root}/build/baseline/src/mangoapp}"
+
+if [[ ! -x "${mangoapp_binary}" ]]; then
+    printf 'Development MangoApp is not executable: %s\n' "${mangoapp_binary}" >&2
+    exit 66
+fi
+
+exec distrobox enter dev -- env \
+    DISPLAY="${DISPLAY:-}" \
+    XAUTHORITY="${XAUTHORITY:-}" \
+    XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+    MANGOHUD_CONFIG="${MANGOHUD_CONFIG:-}" \
+    MANGO_OVERLAY_SOCKET="${MANGO_OVERLAY_SOCKET:-}" \
+    "${mangoapp_binary}" "$@"

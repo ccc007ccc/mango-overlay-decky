@@ -104,7 +104,11 @@ bool ImGui_ImplOpenGL3_CreateFontsTexture(gl_context *ctx)
     ImGuiIO& io = ImGui::GetIO();
     unsigned char* pixels;
     int width, height;
+#ifdef MANGO_OVERLAY_DECKY
+    io.Fonts->GetTexDataAsRGBA32(&pixels, &width, &height);
+#else
     io.Fonts->GetTexDataAsAlpha8(&pixels, &width, &height);
+#endif
 
     // OpenGL specification defaults, overwritten by glGet but initialized just in case.
     GLint last_texture = 0;
@@ -138,7 +142,20 @@ bool ImGui_ImplOpenGL3_CreateFontsTexture(gl_context *ctx)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
+#ifdef MANGO_OVERLAY_DECKY
+    glTexImage2D(
+        GL_TEXTURE_2D,
+        0,
+        GL_RGBA,
+        width,
+        height,
+        0,
+        GL_RGBA,
+        GL_UNSIGNED_BYTE,
+        pixels);
+#else
     glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, width, height, 0, GL_RED, GL_UNSIGNED_BYTE, pixels);
+#endif
 
     // Store our identifier
     io.Fonts->SetTexID((ImTextureID)(intptr_t)ctx->FontTexture);
@@ -257,6 +274,18 @@ static bool    ImGui_ImplOpenGL3_CreateDeviceObjects(gl_context *ctx)
         //"    gl_Position = ProjMtx * vec4(Position.xy,0,1) * vec4(1.0, -1.0, 1, 1);\n"
         "}\n";
 
+#ifdef MANGO_OVERLAY_DECKY
+#define MANGO_OVERLAY_FRAGMENT_SAMPLE_120 \
+        "    gl_FragColor = Frag_Color * texture2D(Texture, Frag_UV.st);\n"
+#define MANGO_OVERLAY_FRAGMENT_SAMPLE \
+        "    Out_Color = Frag_Color * texture(Texture, Frag_UV.st);\n"
+#else
+#define MANGO_OVERLAY_FRAGMENT_SAMPLE_120 \
+        "    gl_FragColor = Frag_Color * vec4(1, 1, 1, texture2D(Texture, Frag_UV.st).r);\n"
+#define MANGO_OVERLAY_FRAGMENT_SAMPLE \
+        "    Out_Color = Frag_Color * vec4(1, 1, 1, texture(Texture, Frag_UV.st).r);\n"
+#endif
+
     const GLchar* fragment_shader_glsl_120 =
         "#ifdef GL_ES\n"
         "    precision mediump float;\n"
@@ -266,7 +295,7 @@ static bool    ImGui_ImplOpenGL3_CreateDeviceObjects(gl_context *ctx)
         "varying vec4 Frag_Color;\n"
         "void main()\n"
         "{\n"
-        "    gl_FragColor = Frag_Color * vec4(1, 1, 1, texture2D(Texture, Frag_UV.st).r);\n"
+        MANGO_OVERLAY_FRAGMENT_SAMPLE_120
         "}\n";
 
     const GLchar* fragment_shader_glsl_130 =
@@ -276,7 +305,7 @@ static bool    ImGui_ImplOpenGL3_CreateDeviceObjects(gl_context *ctx)
         "out vec4 Out_Color;\n"
         "void main()\n"
         "{\n"
-        "    Out_Color = Frag_Color * vec4(1, 1, 1, texture(Texture, Frag_UV.st).r);\n"
+        MANGO_OVERLAY_FRAGMENT_SAMPLE
         "}\n";
 
     const GLchar* fragment_shader_glsl_300_es =
@@ -287,7 +316,7 @@ static bool    ImGui_ImplOpenGL3_CreateDeviceObjects(gl_context *ctx)
         "layout (location = 0) out vec4 Out_Color;\n"
         "void main()\n"
         "{\n"
-        "    Out_Color = Frag_Color * vec4(1, 1, 1, texture(Texture, Frag_UV.st).r);\n"
+        MANGO_OVERLAY_FRAGMENT_SAMPLE
         "}\n";
 
     const GLchar* fragment_shader_glsl_410_core =
@@ -297,8 +326,11 @@ static bool    ImGui_ImplOpenGL3_CreateDeviceObjects(gl_context *ctx)
         "layout (location = 0) out vec4 Out_Color;\n"
         "void main()\n"
         "{\n"
-        "    Out_Color = Frag_Color * vec4(1, 1, 1, texture(Texture, Frag_UV.st).r);\n"
+        MANGO_OVERLAY_FRAGMENT_SAMPLE
         "}\n";
+
+#undef MANGO_OVERLAY_FRAGMENT_SAMPLE
+#undef MANGO_OVERLAY_FRAGMENT_SAMPLE_120
 
     SPDLOG_DEBUG("glsl_version: {}", glsl_version);
 

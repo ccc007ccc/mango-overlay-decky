@@ -5,7 +5,13 @@
 #include "IconsForkAwesome.h"
 #include "forkawesome.h"
 
-void create_fonts(ImFontAtlas* font_atlas, const overlay_params& params, ImFont*& small_font, ImFont*& text_font, ImFont*& secondary_font)
+void create_fonts(
+   ImFontAtlas* font_atlas,
+   const overlay_params& params,
+   ImFont*& small_font,
+   ImFont*& text_font,
+   ImFont*& secondary_font,
+   ImFont** high_density_text_font)
 {
    auto& io = ImGui::GetIO();
    if (!font_atlas)
@@ -117,6 +123,25 @@ void create_fonts(ImFontAtlas* font_atlas, const overlay_params& params, ImFont*
       text_font = font_atlas->AddFontFromFileTTF(font_file_text.c_str(), font_size_text, nullptr, glyph_ranges.Data);
    else
       text_font = font_atlas->Fonts[0];
+
+   if (high_density_text_font) {
+      *high_density_text_font = text_font;
+      for (int index = 0; index < font_atlas->ConfigData.Size; ++index) {
+         const ImFontConfig& source = font_atlas->ConfigData[index];
+         if (source.MergeMode || source.DstFont != text_font)
+            continue;
+
+         ImFontConfig provider_config = source;
+         provider_config.DstFont = nullptr;
+         provider_config.FontDataOwnedByAtlas = false;
+         provider_config.OversampleH = 1;
+         provider_config.OversampleV = 1;
+         if (provider_config.RasterizerDensity < 2.0F)
+            provider_config.RasterizerDensity = 2.0F;
+         *high_density_text_font = font_atlas->AddFont(&provider_config);
+         break;
+      }
+   }
 
    font_atlas->Build();
 }

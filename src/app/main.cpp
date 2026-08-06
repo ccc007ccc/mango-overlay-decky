@@ -10,6 +10,7 @@
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
 #include <stdio.h>
+#include <cstring>
 #include <thread>
 #include <unistd.h>
 #include "../overlay.h"
@@ -26,6 +27,13 @@
 #include <X11/Xatom.h>
 #include <X11/Xlib.h>
 #include <poll.h>
+
+#ifdef MANGO_OVERLAY_DECKY
+#include "mango_overlay/renderer/canvas.hpp"
+#include "mango_overlay/renderer/imgui_scene.hpp"
+#include "mango_overlay/renderer/opengl_texture_backend.hpp"
+#include "mango_overlay/renderer/scene_client.hpp"
+#endif
 
 using namespace std;
 
@@ -45,8 +53,63 @@ static bool mangoapp_paused = false;
 std::mutex mangoapp_m;
 std::condition_variable mangoapp_cv;
 static uint8_t raw_msg[1024] = {0};
-static uint32_t screenWidth, screenHeight;
+static std::atomic_uint32_t screenWidth { 0 };
+static std::atomic_uint32_t screenHeight { 0 };
 static std::atomic_bool g_x_dead{false};
+#ifdef MANGO_OVERLAY_DECKY
+static std::unique_ptr<mango_overlay::renderer::SceneClient> provider_scene_client;
+static std::unique_ptr<mango_overlay::renderer::ImGuiSceneRenderer> provider_scene_renderer;
+static ImFont* provider_scene_font = nullptr;
+#endif
+
+static void create_app_fonts()
+{
+#ifdef MANGO_OVERLAY_DECKY
+    create_fonts(
+        nullptr,
+        params,
+        sw_stats.font_small,
+        sw_stats.font_text,
+        sw_stats.font_secondary,
+        &provider_scene_font);
+    if (provider_scene_renderer)
+        provider_scene_renderer->set_text_font(provider_scene_font);
+#else
+    create_fonts(
+        nullptr,
+        params,
+        sw_stats.font_small,
+        sw_stats.font_text,
+        sw_stats.font_secondary);
+#endif
+}
+
+static void resize_window_to_output(GLFWwindow* window)
+{
+    auto width = screenWidth.load(std::memory_order_relaxed);
+    auto height = screenHeight.load(std::memory_order_relaxed);
+    if (width == 0 || height == 0) {
+        Display* display = glfwGetX11Display();
+        if (display == nullptr)
+            return;
+        const int screen = DefaultScreen(display);
+        width = static_cast<std::uint32_t>(DisplayWidth(display, screen));
+        height = static_cast<std::uint32_t>(DisplayHeight(display, screen));
+    }
+    if (width == 0 || height == 0)
+        return;
+
+    int current_width = 0;
+    int current_height = 0;
+    glfwGetWindowSize(window, &current_width, &current_height);
+    if (current_width != static_cast<int>(width)
+        || current_height != static_cast<int>(height)) {
+        glfwSetWindowSize(
+            window,
+            static_cast<int>(width),
+            static_cast<int>(height));
+    }
+}
 
 static bool x_connection_ok(Display* dpy) {
     if (!dpy)
@@ -228,8 +291,12 @@ static void msg_read_thread(){
                             new_frame = true;
                         }
                         mangoapp_cv.notify_one();
-                        screenWidth = mangoapp_v1->outputWidth;
-                        screenHeight = mangoapp_v1->outputHeight;
+                        screenWidth.store(
+                            mangoapp_v1->outputWidth,
+                            std::memory_order_relaxed);
+                        screenHeight.store(
+                            mangoapp_v1->outputHeight,
+                            std::memory_order_relaxed);
                     }
                 }
             } else {
@@ -291,7 +358,7 @@ static bool render(GLFWwindow* window, overlay_params& real_params) {
     if (sw_stats.font_params_hash != params.font_params_hash)
     {
         sw_stats.font_params_hash = params.font_params_hash;
-        create_fonts(nullptr, params, sw_stats.font_small, sw_stats.font_text, sw_stats.font_secondary);
+        create_app_fonts();
         ImGui_ImplOpenGL3_CreateFontsTexture();
     }
     ImGui_ImplGlfw_NewFrame();
@@ -300,6 +367,18 @@ static bool render(GLFWwindow* window, overlay_params& real_params) {
     overlay_new_frame(real_params);
     position_layer(sw_stats, real_params, window_size);
     render_imgui(sw_stats, real_params, window_size, true);
+#ifdef MANGO_OVERLAY_DECKY
+    if (provider_scene_client && provider_scene_renderer
+        && provider_scene_client->connected()) {
+        const auto provider_snapshot = provider_scene_client->snapshot();
+        const auto display_size = ImGui::GetIO().DisplaySize;
+        provider_scene_renderer->draw(
+            *provider_snapshot,
+            display_size.x,
+            display_size.y,
+            steam_focused);
+    }
+#endif
     get_atom_info();
     overlay_end_frame();
     static bool window_size_changed = false;
@@ -309,15 +388,25 @@ static bool render(GLFWwindow* window, overlay_params& real_params) {
     if (real_params.enabled[OVERLAY_PARAM_ENABLED_horizontal])
     // trying to reduce height will break direct scanout in some cases
     // just leave it for now, we'll revisit it in server
-    glfwSetWindowSize(window, screenWidth, screenHeight);
+        resize_window_to_output(window);
 
     ImGui::EndFrame();
 
     return window_size_changed;
 }
 
-int main(int, char**)
+int main(int argc, char** argv)
 {
+#ifdef MANGO_OVERLAY_DECKY
+    if (argc == 2 && std::strcmp(argv[1], "--mango-overlay-self-test") == 0) {
+        std::printf(
+            "mangoapp version=%s mangohud=%s protocol=1.0 status=ok\n",
+            MANGO_OVERLAY_VERSION,
+            PACKAGE_VERSION);
+        return 0;
+    }
+#endif
+
     XInitThreads();
 
     // Setup window
@@ -337,6 +426,15 @@ int main(int, char**)
     // Create window with graphics context
     GLFWwindow* window = init(glsl_version);
 
+#ifdef MANGO_OVERLAY_DECKY
+    provider_scene_renderer = std::make_unique<mango_overlay::renderer::ImGuiSceneRenderer>(
+        mango_overlay::renderer::make_opengl_texture_backend());
+    provider_scene_client = std::make_unique<mango_overlay::renderer::SceneClient>(
+        mango_overlay::renderer::default_socket_path(),
+        [] { glfwPostEmptyEvent(); });
+    provider_scene_client->start();
+#endif
+
     Display *x11_display = glfwGetX11Display();
     Window x11_window = glfwGetX11Window(window);
     Atom overlay_atom = XInternAtom (x11_display, GamescopeOverlayProperty, False);
@@ -344,7 +442,7 @@ int main(int, char**)
     // Setup Platform/Renderer backends
     int control_client = -1;
     parse_overlay_config(&params, getenv("MANGOHUD_CONFIG"), false);
-    create_fonts(nullptr, params, sw_stats.font_small, sw_stats.font_text, sw_stats.font_secondary);
+    create_app_fonts();
     HUDElements.convert_colors(params);
     init_cpu_stats(params);
     notifier.params = &params;
@@ -385,7 +483,16 @@ int main(int, char**)
     while (!glfwWindowShouldClose(window)){
         real_params = get_params();
         check_keybinds(*real_params);
-        if (!real_params->no_display && new_frame){
+        bool provider_visible = false;
+#ifdef MANGO_OVERLAY_DECKY
+        if (provider_scene_client && provider_scene_client->connected()) {
+            provider_visible = mango_overlay::renderer::snapshot_has_visible_provider(
+                *provider_scene_client->snapshot(), steam_focused);
+        }
+#endif
+        if (provider_visible)
+            resize_window_to_output(window);
+        if ((!real_params->no_display && new_frame) || provider_visible){
             if (mangoapp_paused){
                 glfwShowWindow(window);
                 render(window, *real_params);
@@ -447,11 +554,20 @@ int main(int, char**)
             // std::unique_lock<std::mutex> lk(mangoapp_m);
             // mangoapp_cv.wait(lk, []{return !get_params()->no_display;});
         } else {
+#ifdef MANGO_OVERLAY_DECKY
+            glfwWaitEventsTimeout(0.5);
+#else
             usleep(500000);
+#endif
         }
     }
 
     // Cleanup
+#ifdef MANGO_OVERLAY_DECKY
+    provider_scene_client->stop();
+    provider_scene_client.reset();
+    provider_scene_renderer.reset();
+#endif
     shutdown(window);
 
     glfwTerminate();

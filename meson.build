@@ -293,6 +293,30 @@ if get_option('mangoapp')
   glfw3_dep = dependency('glfw3')
 endif
 
+if get_option('mango_overlay_decky').enabled()
+  mango_overlay_version = run_command(
+    prog_python,
+    '-c',
+    'import json,re,sys; value=json.load(open(sys.argv[1], encoding="utf-8"))["version"]; assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}", value); print(value)',
+    meson.project_source_root() / 'plugin/package.json',
+    check: true,
+  ).stdout().strip()
+  add_project_arguments(
+    '-DMANGO_OVERLAY_VERSION="@0@"'.format(mango_overlay_version),
+    language: ['c', 'cpp'],
+  )
+  subdir('protocol')
+  subdir('resource')
+  subdir('scene')
+  subdir('wire')
+  subdir('broker')
+  subdir('client')
+  subdir('renderer')
+  subdir('tools')
+  subdir('plugin')
+  subdir('packaging')
+endif
+
 subdir('src')
 
 if get_option('include_doc')

@@ -1,0 +1,326 @@
+namespace MangoOverlay.Wire;
+
+enum Role : ubyte {
+  Unknown = 0,
+  Provider = 1,
+  Renderer = 2,
+  Controller = 3
+}
+
+struct Version {
+  major: ushort;
+  minor: ushort;
+}
+
+table Hello {
+  role: Role = Unknown;
+  minimum_version: Version;
+  maximum_version: Version;
+  required_capabilities: ulong = 0;
+  optional_capabilities: ulong = 0;
+  client_version: string;
+}
+
+table HelloAccepted {
+  selected_version: Version;
+  enabled_capabilities: ulong = 0;
+  server_version: string;
+}
+
+enum ErrorCode : ushort {
+  Unknown = 0,
+  MalformedPacket = 1,
+  UnexpectedMessage = 2,
+  MalformedPayload = 3,
+  UnsupportedVersion = 4,
+  UnsupportedRequiredCapability = 5,
+  InvalidRole = 6,
+  OperationFailed = 7,
+  NotFound = 8
+}
+
+table ErrorResponse {
+  code: ErrorCode = Unknown;
+  message: string;
+}
+
+enum Visibility : ubyte {
+  GameOnly = 0,
+  SteamOnly = 1,
+  Always = 2
+}
+
+table RegisterProvider {
+  application_id: string;
+  instance_id: string;
+  display_name: string;
+  canvas_width: ushort;
+  canvas_height: ushort;
+  requested_visibility: Visibility = GameOnly;
+}
+
+table ProviderRegistered {
+  scene_revision: ulong;
+}
+
+struct Vec2 {
+  x: float;
+  y: float;
+}
+
+struct Color {
+  red: float;
+  green: float;
+  blue: float;
+  alpha: float;
+}
+
+enum Anchor : ubyte {
+  TopLeft = 0,
+  TopCenter = 1,
+  TopRight = 2,
+  CenterLeft = 3,
+  Center = 4,
+  CenterRight = 5,
+  BottomLeft = 6,
+  BottomCenter = 7,
+  BottomRight = 8
+}
+
+table ClipRect {
+  position: Vec2;
+  size: Vec2;
+}
+
+table ElementLayout {
+  parent_id: ulong = 0;
+  translation: Vec2;
+  scale: Vec2;
+  rotation_degrees: float = 0;
+  opacity: float = 1;
+  anchor: Anchor = TopLeft;
+  clip: ClipRect;
+  hidden: bool = false;
+}
+
+table GroupElement {
+}
+
+table TextElement {
+  position: Vec2;
+  text: string;
+  font_size: float;
+  color: Color;
+}
+
+table RectangleElement {
+  position: Vec2;
+  size: Vec2;
+  corner_radius: float;
+  color: Color;
+}
+
+table LineElement {
+  start: Vec2;
+  end: Vec2;
+  thickness: float;
+  color: Color;
+}
+
+table PolylineElement {
+  points: [Vec2];
+  thickness: float;
+  color: Color;
+}
+
+table CircleElement {
+  center: Vec2;
+  radius: float;
+  color: Color;
+}
+
+table ImageElement {
+  position: Vec2;
+  size: Vec2;
+  resource_id: ulong;
+  tint: Color;
+}
+
+table GifElement {
+  position: Vec2;
+  size: Vec2;
+  resource_id: ulong;
+  tint: Color;
+  playback_rate: float = 1;
+  paused: bool = false;
+  frame_index: uint = 0;
+}
+
+union ElementContent {
+  TextElement,
+  RectangleElement,
+  LineElement,
+  PolylineElement,
+  CircleElement,
+  GroupElement,
+  ImageElement,
+  GifElement
+}
+
+table Element {
+  id: ulong;
+  z_index: int;
+  content: ElementContent;
+  layout: ElementLayout;
+}
+
+table UpsertElement {
+  element: Element;
+}
+
+table RemoveElement {
+  element_id: ulong;
+}
+
+union MutationContent {
+  UpsertElement,
+  RemoveElement
+}
+
+table Mutation {
+  content: MutationContent;
+}
+
+table SceneTransaction {
+  transaction_id: ulong;
+  mutations: [Mutation];
+}
+
+table TransactionCommitted {
+  transaction_id: ulong;
+  scene_revision: ulong;
+  already_applied: bool = false;
+}
+
+table UploadResource {
+  resource_id: ulong;
+  encoded_size: uint;
+  inline_data: [ubyte];
+}
+
+table ResourceStored {
+  resource_id: ulong;
+  width: uint;
+  height: uint;
+  frame_count: uint;
+}
+
+table ReleaseResource {
+  resource_id: ulong;
+}
+
+table ResourceReleased {
+  resource_id: ulong;
+}
+
+table ResourceAvailable {
+  revision: ulong;
+  application_id: string;
+  instance_id: string;
+  resource_id: ulong;
+  encoded_size: uint;
+  inline_data: [ubyte];
+}
+
+table RendererSubscribe {
+  known_revision: ulong = 0;
+}
+
+table ProviderScene {
+  application_id: string;
+  instance_id: string;
+  display_name: string;
+  canvas_width: ushort;
+  canvas_height: ushort;
+  requested_visibility: Visibility = GameOnly;
+  elements: [Element];
+}
+
+table SceneSnapshotBegin {
+  revision: ulong;
+  provider_count: uint;
+}
+
+table SceneSnapshotProvider {
+  revision: ulong;
+  provider: ProviderScene;
+}
+
+table SceneSnapshotEnd {
+  revision: ulong;
+}
+
+table ProviderSceneUpdated {
+  revision: ulong;
+  provider: ProviderScene;
+}
+
+table ProviderSceneRemoved {
+  revision: ulong;
+  application_id: string;
+  instance_id: string;
+}
+
+table ControllerGetStatus {
+}
+
+table ControllerSetEnabled {
+  enabled: bool = true;
+}
+
+table ControllerSetRequireApproval {
+  required: bool = false;
+}
+
+table ControllerSetApplicationPolicy {
+  application_id: string;
+  approved: bool = true;
+  visible: bool = true;
+  order: int = 0;
+}
+
+table ControllerSetApplicationPosition {
+  application_id: string;
+  position: uint = 0;
+}
+
+table ControllerApplicationStatus {
+  application_id: string;
+  display_name: string;
+  approved: bool = true;
+  visible: bool = true;
+  order: int = 0;
+  active_instances: uint = 0;
+}
+
+table ControllerStatus {
+  enabled: bool = true;
+  require_approval: bool = false;
+  scene_revision: ulong = 0;
+  applications: [ControllerApplicationStatus];
+}
+
+table PersistedApplicationPolicy {
+  application_id: string;
+  display_name: string;
+  approved: bool = true;
+  visible: bool = true;
+  order: int = 0;
+}
+
+table PolicyDocument {
+  schema: uint = 1;
+  enabled: bool = true;
+  require_approval: bool = false;
+  applications: [PersistedApplicationPolicy];
+}
