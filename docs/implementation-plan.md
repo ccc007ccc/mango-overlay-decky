@@ -92,7 +92,7 @@
 
 ## 阶段 7：多产品共享 Runtime Coordinator（首版后）
 
-该阶段不阻塞第一版发布，但必须在心率等 Decky 产品内置 Mango Overlay Runtime 前完成：
+该阶段不阻塞第一版发布，但必须在任何第三方 Decky 产品内置 Mango Overlay Runtime 前完成：
 
 1. 把候选清单、运行时声明、活动指针和失败修订定义为版本化的共享磁盘合同。
 2. 将当前单插件生命周期深化为本项目拥有的 Runtime Coordinator，并提供最小的

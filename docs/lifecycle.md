@@ -89,7 +89,7 @@ ready   -> failed -> system_fallback
 
 ## 多产品共享核心目标（首版后）
 
-第一版安装状态只服务于 Mango Overlay Decky 自身。未来心率等产品插件直接内置该运行时
+第一版安装状态只服务于 Mango Overlay Decky 自身。未来第三方产品插件直接内置该运行时
 时，生命周期所有权仍属于本项目，并升级为多运行时声明模型；调用方不得复制
 `LifecycleManager` 后各自争抢 drop-in。
 
