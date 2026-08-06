@@ -42,6 +42,7 @@ jobs:
             libwebp-dev \
             libx11-dev \
             libxkbcommon-dev \
+            libxrandr-dev \
             meson \
             ninja-build \
             pkg-config \
@@ -114,7 +115,6 @@ jobs:
             gcc-multilib \
             glslang-tools \
             libegl-dev:i386 \
-            libflatbuffers-dev:i386 \
             libgif-dev:i386 \
             libgl-dev:i386 \
             libjpeg-dev:i386 \
@@ -137,6 +137,7 @@ jobs:
         run: |
           meson setup build/i686 . \
             --buildtype=release \
+            --force-fallback-for=flatbuffers \
             -Dinclude_doc=false \
             -Dmango_overlay_decky=enabled \
             -Dmangoapp=false \
@@ -147,9 +148,9 @@ jobs:
             -Dwith_nvml=disabled \
             -Dwith_xnvctrl=disabled
           meson compile -C build/i686 \
-            src/libMangoHud.so \
-            src/libMangoHud_opengl.so \
-            src/libMangoHud_shim.so
+            MangoHud:shared_library \
+            MangoHud_opengl \
+            MangoHud_shim
 
       - name: Verify i686 ABI and dependencies
         run: |
@@ -159,7 +160,8 @@ jobs:
             build/i686/src/libMangoHud_shim.so
           )
           for artifact in "${artifacts[@]}"; do
-            file -Lb "${artifact}" | grep -F 'ELF 32-bit LSB shared object, Intel 80386'
+            file -Lb "${artifact}" \
+              | grep -Eq 'ELF 32-bit LSB shared object, Intel (80386|i386)'
             readelf -h "${artifact}" | grep -Eq 'Class:[[:space:]]+ELF32'
             readelf -h "${artifact}" | grep -Eq 'Machine:[[:space:]]+Intel 80386'
             if ldd "${artifact}" | grep -F 'not found'; then
