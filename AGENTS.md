@@ -11,8 +11,8 @@
 ## Product Scope
 
 - Mango Overlay Decky is a drawing platform for SteamOS. It does not collect FPS or own provider business data.
-- The first release targets both SteamOS Game Mode through MangoApp/Gamescope and games launched from KDE through MangoHud Vulkan/OpenGL injection.
-- Both modes use the same provider protocol, committed scenes, resources, and shared renderer core; desktop-only differences stay in ABI-specific injection and launch propagation.
+- The first release targets SteamOS Game Mode through MangoApp/Gamescope.
+- Desktop-mode renderer experiments remain in the repository, but they are not packaged, enabled, documented as a user feature, or required by first-release CI.
 - A KDE desktop-wide overlay, input handling, video, SVG, custom shaders, and uploaded custom fonts are out of scope for the first release.
 
 ## Architecture Invariants

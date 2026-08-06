@@ -267,7 +267,6 @@ def _default_verify_runtime(runtime: Path, version: str) -> None:
                 "runtime_self_test_failed",
                 f"{name} self-test returned {result.returncode}: {detail}",
             )
-    _verify_desktop_runtime(runtime)
 
 
 class LifecycleManager:

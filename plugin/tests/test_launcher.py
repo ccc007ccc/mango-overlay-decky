@@ -238,7 +238,7 @@ class LauncherTests(unittest.TestCase):
             "PATH": "/usr/bin",
             "LD_LIBRARY_PATH": "/steam/runtime",
             "LD_PRELOAD": "/usr/lib/libMangoHud_shim.so libcapture.so",
-            "MANGOHUD_CONFIG": "fps_limit=60,no_display=1",
+            "MANGOHUD_CONFIG": "fps_limit=60,position=top-left",
             "DISABLE_MANGOHUD": "1",
             "VK_INSTANCE_LAYERS": "system-layer",
             "VK_LOADER_LAYERS_DISABLE": "~implicit~",
@@ -260,8 +260,10 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(executable, "game")
         self.assertEqual(executed_arguments, ["game", "--flag"])
         self.assertEqual(environment["MANGOHUD"], "1")
-        self.assertEqual(environment["MANGOHUD_CONFIGFILE"], "/dev/null")
-        self.assertEqual(environment["MANGOHUD_CONFIG"], "fps_limit=60,no_display=1")
+        self.assertNotIn("MANGOHUD_CONFIGFILE", environment)
+        self.assertEqual(
+            environment["MANGOHUD_CONFIG"], "fps_limit=60,position=top-left"
+        )
         self.assertEqual(
             environment["MANGO_OVERLAY_SOCKET"],
             f"/run/user/{os.geteuid()}/mango-overlay-decky.sock",
@@ -292,22 +294,30 @@ class LauncherTests(unittest.TestCase):
         ):
             self.assertNotIn(name, environment)
 
-    def test_desktop_launch_defaults_to_provider_only_canvas(self) -> None:
+    def test_desktop_launch_does_not_override_steam_performance_config(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             environment = launcher.desktop_environment(self.runtime, {})
         self.assertIsNotNone(environment)
         assert environment is not None
-        self.assertEqual(environment["MANGOHUD_CONFIG"], "no_display=1")
+        self.assertNotIn("MANGOHUD_CONFIG", environment)
+        self.assertNotIn("MANGOHUD_CONFIGFILE", environment)
 
-    def test_desktop_launch_rejects_an_incomplete_runtime(self) -> None:
+    def test_desktop_launch_without_experimental_runtime_passes_through(self) -> None:
         (self.runtime / "lib32/libMangoHud_shim.so").unlink()
+        inherited = {
+            "PATH": "/usr/bin",
+            "MANGOHUD": "1",
+            "MANGOHUD_CONFIG": "fps_only",
+        }
         with (
             patch.object(launcher, "active_runtime", return_value=self.runtime),
             patch.object(sys, "argv", ["launcher.py", "desktop", "--", "game"]),
-            patch.object(os, "execvpe") as execute,
+            patch.dict(os.environ, inherited, clear=True),
+            patch.object(os, "execvpe", side_effect=RuntimeError("exec")) as execute,
         ):
-            self.assertEqual(launcher.main(), 69)
-        execute.assert_not_called()
+            with self.assertRaisesRegex(RuntimeError, "exec"):
+                launcher.main()
+        execute.assert_called_once_with("game", ["game"], inherited)
 
     def test_desktop_launch_requires_a_command_separator(self) -> None:
         with (

@@ -75,88 +75,15 @@ RUNTIME_FILES = (
         0o644,
     ),
     (
-        "runtime/lib/libMangoHud.so",
-        "desktop/x86_64/libMangoHud.so",
-        0o644,
-    ),
-    (
-        "runtime/lib/libMangoHud_opengl.so",
-        "desktop/x86_64/libMangoHud_opengl.so",
-        0o644,
-    ),
-    (
-        "runtime/lib/libMangoHud_shim.so",
-        "desktop/x86_64/libMangoHud_shim.so",
-        0o644,
-    ),
-    (
-        "runtime/lib/libgif.so.7",
-        "desktop/x86_64/libgif.so.7",
-        0o644,
-    ),
-    (
-        "runtime/lib32/libMangoHud.so",
-        "desktop/i686/libMangoHud.so",
-        0o644,
-    ),
-    (
-        "runtime/lib32/libMangoHud_opengl.so",
-        "desktop/i686/libMangoHud_opengl.so",
-        0o644,
-    ),
-    (
-        "runtime/lib32/libMangoHud_shim.so",
-        "desktop/i686/libMangoHud_shim.so",
-        0o644,
-    ),
-    (
-        "runtime/lib32/libgif.so.7",
-        "desktop/i686/libgif.so.7",
-        0o644,
-    ),
-    (
-        "runtime/lib32/libsharpyuv.so.0",
-        "desktop/i686/libsharpyuv.so.0",
-        0o644,
-    ),
-    (
-        "runtime/lib32/libwebp.so.7",
-        "desktop/i686/libwebp.so.7",
-        0o644,
-    ),
-    (
         "runtime/licenses/libjpeg62-turbo/copyright",
         "runtime-deps/libjpeg62-turbo-copyright",
         0o644,
     ),
-    (
-        "runtime/licenses/libgif7/copyright",
-        "runtime-deps/libgif7-copyright",
-        0o644,
-    ),
-    (
-        "runtime/licenses/libsharpyuv0/copyright",
-        "runtime-deps/libsharpyuv0-copyright",
-        0o644,
-    ),
-    (
-        "runtime/licenses/libwebp7/copyright",
-        "runtime-deps/libwebp7-copyright",
-        0o644,
-    ),
 )
 
+# Desktop renderer sources and development tools remain in the repository, but
+# the first-release Decky package is intentionally Game Mode only.
 VULKAN_LAYER_MANIFESTS = (
-    (
-        "runtime/share/vulkan/implicit_layer.d/MangoOverlay.x86_64.json",
-        "VK_LAYER_MANGOHUD_overlay_x86_64",
-        "../../../lib/libMangoHud.so",
-    ),
-    (
-        "runtime/share/vulkan/implicit_layer.d/MangoOverlay.x86.json",
-        "VK_LAYER_MANGOHUD_overlay_x86",
-        "../../../lib32/libMangoHud.so",
-    ),
 )
 
 

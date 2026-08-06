@@ -11,7 +11,6 @@ readonly CACHE_ROOT="${MANGO_OVERLAY_STEAMRT_CACHE:-/var/tmp/mango-overlay-decky
 readonly ARCHIVE_PATH="${CACHE_ROOT}/${STEAMRT_ARCHIVE}"
 readonly SDK_ROOT="${CACHE_ROOT}/root"
 readonly OUTPUT_DIRECTORY="${MANGO_OVERLAY_PACKAGE_OUTPUT:-${SOURCE_ROOT}/build/package}"
-readonly DESKTOP_OUTPUT="${MANGO_OVERLAY_STEAMRT_DESKTOP_OUTPUT:-${SOURCE_ROOT}/build/steamrt4-desktop}"
 
 temporary_path=""
 
@@ -46,7 +45,7 @@ for command in bwrap cargo curl meson ninja pnpm python3 sha256sum systemd-analy
     fi
 done
 
-mkdir -p "${CACHE_ROOT}" "${OUTPUT_DIRECTORY}" "${DESKTOP_OUTPUT}"
+mkdir -p "${CACHE_ROOT}" "${OUTPUT_DIRECTORY}"
 
 if [[ -f "${ARCHIVE_PATH}" ]]; then
     actual_sha256="$(sha256sum "${ARCHIVE_PATH}" | cut -d ' ' -f 1)"
@@ -132,10 +131,6 @@ fi
     pnpm verify
 )
 
-MANGO_OVERLAY_STEAMRT_CACHE="${CACHE_ROOT}" \
-MANGO_OVERLAY_STEAMRT_DESKTOP_OUTPUT="${DESKTOP_OUTPUT}" \
-    "${SOURCE_ROOT}/tools/build-desktop-steamrt4.sh" all
-
 source_date_epoch="$(git -C "${SOURCE_ROOT}" log -1 --format=%ct)"
 build_command=$(cat <<'EOF'
 set -euo pipefail
@@ -178,31 +173,6 @@ install -m 0644 \
 install -m 0644 \
     /usr/share/doc/libjpeg62-turbo/copyright \
     /work/build/runtime-deps/libjpeg62-turbo-copyright
-install -m 0644 \
-    /usr/share/doc/libgif7/copyright \
-    /work/build/runtime-deps/libgif7-copyright
-install -m 0644 \
-    /usr/share/doc/libsharpyuv0/copyright \
-    /work/build/runtime-deps/libsharpyuv0-copyright
-install -m 0644 \
-    /usr/share/doc/libwebp7/copyright \
-    /work/build/runtime-deps/libwebp7-copyright
-
-mkdir -p /work/build/desktop/x86_64 /work/build/desktop/i686
-install -m 0644 \
-    /desktop/x86_64/libMangoHud.so \
-    /desktop/x86_64/libMangoHud_opengl.so \
-    /desktop/x86_64/libMangoHud_shim.so \
-    /desktop/x86_64/libgif.so.7 \
-    /work/build/desktop/x86_64/
-install -m 0644 \
-    /desktop/i686/libMangoHud.so \
-    /desktop/i686/libMangoHud_opengl.so \
-    /desktop/i686/libMangoHud_shim.so \
-    /desktop/i686/libgif.so.7 \
-    /desktop/i686/libsharpyuv.so.0 \
-    /desktop/i686/libwebp.so.7 \
-    /work/build/desktop/i686/
 
 export LD_LIBRARY_PATH=/work/build/runtime-deps:/work/build/client
 for executable in \
@@ -225,7 +195,6 @@ EOF
 "${sdk_base[@]}" \
     --unshare-net \
     --ro-bind "${SOURCE_ROOT}" /source \
-    --ro-bind "${DESKTOP_OUTPUT}" /desktop \
     --bind "${OUTPUT_DIRECTORY}" /output \
     --setenv SOURCE_DATE_EPOCH "${source_date_epoch}" \
     --chdir /source \

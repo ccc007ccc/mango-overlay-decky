@@ -6,7 +6,7 @@
 - 宿主 SteamOS 只运行构建产物和系统自带工具，不安装开发依赖。
 - 日常修改不需要重启 SteamOS。
 - 不覆盖 `/usr/bin/mangoapp`，任何测试都必须有明确的原版恢复路径。
-- 无显示测试覆盖共享核心；图形测试分别覆盖游戏模式和桌面游戏的真实入口。
+- 无显示测试覆盖共享核心；首版图形验收只覆盖游戏模式。桌面图形工具属于保留实验。
 
 ## 四层测试
 
@@ -49,7 +49,7 @@ tools/run-nested-baseline.sh
 
 项目应提供 `tools/run-nested.sh`，自动选择开发二进制、启动示例提供者、收集日志并在退出时清理临时文件，避免开发者手工拼接环境变量。
 
-### 3. 正式包从桌面到游戏模式测试
+### 3. 正式 game-mode-only 包测试
 
 正式包的生命周期和代理不依赖游戏模式。先在桌面模式执行只读预检：
 
@@ -69,20 +69,11 @@ python3 tools/activate-package-desktop.py \
 
 这一步覆盖 Decky 后端最关键的文件验证、事务恢复、用户服务安装和代理启动，失败时可直接在桌面修复，不需要重启或切换会话。
 
-正式 Decky 包激活后，在 KDE Steam 游戏中设置一次启动选项：
+正式包不携带 KDE 注入运行时，也不需要任何 Steam 启动项。若游戏属性中仍保留旧测试
+命令，应删除并恢复默认启动方式；新启动器在 game-mode-only 运行时中只会原样透传，
+不会设置 `no_display` 或其他注入变量。
 
-```text
-~/.local/libexec/mango-overlay-decky/launcher.py desktop -- %command%
-```
-
-打开插件测试画布后，先验证一个 OpenGL 游戏和一个 Vulkan/DXVK/VKD3D 游戏。两者
-应显示同一套文字、图形、PNG 和 GIF；改变窗口尺寸或全屏后画布应恢复。桌面启动器
-默认设置 `no_display=1`，所以只显示提供者画布；用户显式设置的 `MANGOHUD_CONFIG`
-会保留。桌面测试失败时，退出游戏并临时把启动选项恢复为 `%command%` 即可停止注入，
-不会改变插件安装状态。
-
-桌面正式入口通过后，才从桌面模式切换一次游戏模式做最终 Steam 集成验收；切换会话
-不需要重启设备。
+桌面生命周期预检通过后，切换一次游戏模式做 Steam 集成验收；切换会话不需要重启设备。
 
 进入游戏模式后，通过另一台设备 SSH 连接 SteamOS，完成后续迭代。
 
@@ -124,7 +115,10 @@ python3 ~/.local/libexec/mango-overlay-decky/lifecycle.py \
 - 桌面模式和游戏模式切换：切换会话，不重启系统。
 - SteamOS 或 MangoHud 升级兼容性：升级后重新执行兼容矩阵。
 
-## 桌面游戏渲染器开发矩阵
+## 桌面游戏渲染器实验矩阵
+
+本节只记录保留的研发工具和历史验证。它们不进入正式包、不属于首版 CI 或兼容承诺，
+也不能作为要求用户配置 Steam 启动项的依据。
 
 桌面模式支持指“从 KDE 中启动游戏后，在游戏画面内绘制”，不是创建一个覆盖整个 KDE 桌面的常驻窗口。该后端使用 MangoHud 的 Vulkan 隐式层和 OpenGL shim，矩阵覆盖 Vulkan、OpenGL、`x86_64`、`i686`、Proton、全屏、无边框和多游戏进程场景，并验证 Steam Runtime 内仍能访问同一场景代理 IPC。
 
@@ -229,9 +223,8 @@ X11 window、surface 和 swapchain；检查先确认两边同时显示，再让�
 连续确认 B 的提供者画布仍然可见。`check-desktop-steamrt4-visible.sh all` 已包含这两格。
 
 兼容性是有边界的：游戏模式固定 MangoHud/MangoApp 与 Gamescope 基线，并在运行时
-自检失败时回退系统 MangoApp；桌面注入按原生 GLX/EGL/Vulkan、SteamRT4 和 Proton
-矩阵分别验证。升级 SteamOS、MangoHud、Steam Runtime、Proton 或 Vulkan loader 后，
-应重新运行对应构建和矩阵，不能仅凭旧版本通过推断新版本兼容。
+自检失败时回退系统 MangoApp。桌面实验曾按原生 GLX/EGL/Vulkan、SteamRT4 和 Proton
+矩阵验证，但不作持续兼容承诺；未来重新启用前必须在目标版本重跑全部相关矩阵。
 
 桌面渲染器的合成性能参考使用：
 
@@ -316,8 +309,8 @@ message
   空 broker 和典型场景下的 CPU 与 RSS，生成可重复的回归参考。
 - `tools/run-desktop-recovery-test.sh`：为真实挂起恢复和输出切换同时打开 OpenGL 与
   Proton D3D12/Vulkan 窗口；`--stop` 是已验证的清理命令。
-- `packaging/build-steamrt4.sh`：在固定 Steam Runtime 4 中构建游戏模式、桌面双 ABI 并打包。
-- `packaging/verify-packaged-sdk.py`：临时安装最终 zip，验证双 ABI、桌面启动器、生命周期和四套 SDK。
+- `packaging/build-steamrt4.sh`：使用固定 Steam Runtime 4 sysroot 构建并打包游戏模式运行时。
+- `packaging/verify-packaged-sdk.py`：临时安装最终 zip，验证 game-mode-only 文件边界、遗留启动项透传、生命周期和四套 SDK。
 
 ## 最低验收矩阵
 
@@ -327,9 +320,6 @@ message
 | 一个提供者更新 | 数值平滑更新，渲染线程不阻塞 |
 | 多元素事务提交 | 所有变化在同一快照出现，不显示半更新画面 |
 | 游戏模式渲染器重启 | 场景代理保持场景，重连后获得完整快照 |
-| 桌面 OpenGL/Vulkan 游戏 | 使用同一启动选项显示同一提供者场景 |
-| 32/64 位桌面游戏 | `$LIB` 选择正确 ABI，不加载另一架构的库 |
-| 桌面游戏退出 | 只结束该渲染会话，安装状态和代理保持不变 |
 | 多个提供者同名字段 | 按提供者隔离，不互相覆盖 |
 | 提供者崩溃 | 连接关闭后自动移除数据 |
 | 恶意超长或高频输入 | 被拒绝或限流，覆盖层继续运行 |

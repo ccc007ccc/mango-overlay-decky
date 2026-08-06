@@ -128,8 +128,6 @@ def desktop_environment(
     ):
         environment.pop(name, None)
     environment["MANGOHUD"] = "1"
-    environment.setdefault("MANGOHUD_CONFIGFILE", "/dev/null")
-    environment.setdefault("MANGOHUD_CONFIG", "no_display=1")
     environment["MANGOHUD_OPENGL_LIBS"] = opengl
     environment["MANGO_OVERLAY_SOCKET"] = (
         f"/run/user/{os.geteuid()}/mango-overlay-decky.sock"
@@ -205,17 +203,20 @@ def main() -> int:
     if role == "desktop":
         if len(sys.argv) < 4 or sys.argv[2] != "--":
             return 64
-        runtime = active_runtime()
-        if runtime is None:
-            return 69
-        environment = desktop_environment(runtime, os.environ.copy())
-        if environment is None:
-            return 69
         command = sys.argv[3:]
+        inherited_environment = os.environ.copy()
+        runtime = active_runtime()
+        environment = (
+            desktop_environment(runtime, inherited_environment)
+            if runtime is not None
+            else None
+        )
+        if environment is None:
+            environment = inherited_environment
         try:
             os.execvpe(command[0], command, environment)
         except OSError as error:
-            print(f"Desktop game could not start: {error}", file=sys.stderr)
+            print(f"Game could not start: {error}", file=sys.stderr)
             return 70
         return 70
 

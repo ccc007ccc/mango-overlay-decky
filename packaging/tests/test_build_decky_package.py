@@ -88,6 +88,19 @@ class DeckyPackageTests(unittest.TestCase):
             )
             self.assertEqual((library.external_attr >> 16) & 0o777, 0o644)
 
+            forbidden_desktop_paths = (
+                f"{PLUGIN_DIRECTORY}/runtime/lib32/",
+                f"{PLUGIN_DIRECTORY}/runtime/lib/libMangoHud.so",
+                f"{PLUGIN_DIRECTORY}/runtime/lib/libMangoHud_opengl.so",
+                f"{PLUGIN_DIRECTORY}/runtime/lib/libMangoHud_shim.so",
+                f"{PLUGIN_DIRECTORY}/runtime/share/vulkan/implicit_layer.d/",
+            )
+            for name in names:
+                self.assertFalse(
+                    name.startswith(forbidden_desktop_paths),
+                    f"game-mode package unexpectedly contains desktop runtime: {name}",
+                )
+
             for archive_path, layer_name, library_path in VULKAN_LAYER_MANIFESTS:
                 layer = json.loads(
                     archive.read(f"{PLUGIN_DIRECTORY}/{archive_path}")

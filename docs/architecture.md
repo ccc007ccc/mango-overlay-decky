@@ -1,13 +1,13 @@
 # Mango Overlay Decky 架构
 
-状态：双模式首发实现完成，等待正式包的桌面模式到游戏模式设备验收
+状态：游戏模式首发实现完成，等待真实设备发布验收
 日期：2026-08-06
 
 ## 目标
 
-Mango Overlay Decky 是面向 SteamOS 的绘制平台，第一版同时支持游戏模式以及桌面模式中启动的游戏。其他程序拥有各自的提供者画布，可以指定坐标并绘制文字、图片、GIF 等元素，由覆盖层负责合成。
+Mango Overlay Decky 是面向 SteamOS 的绘制平台，第一版只支持游戏模式。其他程序拥有各自的提供者画布，可以指定坐标并绘制文字、图片、GIF 等元素，由覆盖层负责合成。
 
-桌面游戏渲染器是游戏进程内的 MangoHud 注入路径，与普通 KDE 桌面常驻窗口不是同一个需求。
+桌面游戏渲染器实验仍保留在仓库中，但不进入正式包，也不是当前用户功能。它是游戏进程内的 MangoHud 注入路径，与普通 KDE 桌面常驻窗口不是同一个需求。
 
 项目只负责绘制平台本身，不采集游戏 FPS，也不内置硬件监控业务。
 
@@ -16,8 +16,6 @@ Mango Overlay Decky 是面向 SteamOS 的绘制平台，第一版同时支持游
 包含：
 
 - 在 SteamOS 游戏模式现有的 Gamescope 外部覆盖层中绘制第三方内容。
-- 在 KDE 中启动的原生、Steam Runtime 与 Proton 游戏内绘制同一套第三方内容。
-- 同时提供 `x86_64` 与 `i686` Vulkan/OpenGL 注入运行时和单一桌面启动接口。
 - 保持 Steam 对 MangoApp 的显示开关、预设和布局控制可用。
 - 提供同一用户下的本地 IPC，允许多个程序同时发布可定位的绘制内容。
 - 提供 Decky 页面管理启用状态、显示策略、提供者状态和诊断信息。
@@ -26,6 +24,7 @@ Mango Overlay Decky 是面向 SteamOS 的绘制平台，第一版同时支持游
 
 暂不包含：
 
+- 桌面模式中运行游戏时的正式渲染器或逐游戏启动项。
 - KDE 桌面上的常驻覆盖窗口。
 - FPS 或交换链探针。
 - 替第三方程序采集业务数据。
@@ -39,8 +38,8 @@ Mango Overlay Decky 是面向 SteamOS 的绘制平台，第一版同时支持游
 ```text
 绘制提供者 ──本地 IPC──> mango-overlayd 场景代理
                                   ├──> 游戏模式渲染器 ──> MangoApp / Gamescope
-                                  ├──> 桌面 Vulkan 渲染器
-                                  └──> 桌面 OpenGL 渲染器
+                                  ├──> 桌面 Vulkan 渲染器（保留实验）
+                                  └──> 桌面 OpenGL 渲染器（保留实验）
 
 Decky 插件 ──控制接口─────────────> 场景代理与稳定生命周期助手
 ```
@@ -57,16 +56,9 @@ Steam ──MangoHud 配置与 preset──────────────�
 Decky 插件 ──控制接口──> 配置、状态、诊断与安全切换
 ```
 
-桌面游戏从同一个活动运行时进入：
-
-```text
-Steam 启动选项
-  -> launcher.py desktop -- %command%
-       -> x86_64/i686 OpenGL shim
-       -> x86_64/i686 Vulkan implicit layer
-       -> SceneClient -> SceneSnapshot -> ImGuiSceneRenderer
-       -> mango-overlayd
-```
+第一版活动运行时不包含桌面注入库或 Vulkan layer manifest，也不要求 Steam 游戏
+启动项。遗留桌面启动命令在缺少实验运行时时仅透传原命令，不能改变 Steam/MangoHud
+环境。
 
 SteamOS 游戏模式的启动链保持不变：
 
@@ -97,7 +89,7 @@ gamescope-session.target
 
 在完成协议兼容测试前，不直接跟随 MangoHud 最新 `master`。
 
-### 桌面游戏渲染器
+### 桌面游戏渲染器（未发布实验）
 
 - 普通桌面游戏使用 MangoHud 的游戏内注入路径，不使用 MangoApp 或 KDE layer-shell。
 - Vulkan 游戏通过 MangoHud 隐式层在交换链提交前绘制；OpenGL 游戏通过 MangoHud shim 在交换缓冲前绘制。
@@ -113,18 +105,20 @@ gamescope-session.target
 - 对外只暴露 `launcher.py desktop -- %command%`。启动器从内容寻址的活动运行时选择
   `$LIB` 对应 ABI，清理冲突的 MangoHud shim，再统一设置 manifest、preload、私有库
   搜索路径和场景 socket；调用方不区分原生、Steam Runtime 或 Proton。
+- 上述入口只适用于显式构造的实验运行时。第一版 Decky 包没有这些产物，入口会
+  原样启动游戏，且不设置 `MANGOHUD_CONFIG=no_display=1`。
 
 ### 版本兼容边界
 
 - 游戏模式以仓库固定的 MangoHud/MangoApp 提交和 SteamOS Gamescope 协议为兼容
   基线；启动自检失败时回退系统 `mangoapp`，不承诺任意 MangoHud master 或
   Gamescope 版本都能直接替换运行时。
-- 桌面渲染器的提供者协议是独立的版本化合同；渲染器通过能力协商拒绝未知必需
+- 保留的桌面渲染器实验使用同一版本化提供者合同；渲染器通过能力协商拒绝未知必需
   能力，因此 daemon、游戏模式和桌面渲染器可以按合同演进。
 - 图形注入兼容性由架构和宿主入口决定：原生 GLX/EGL/Vulkan、SteamRT4、Proton
   各有可重复的验收矩阵；每种 ABI 使用独立 ELF 产物，不把 32 位库注入 64 位进程。
-- Steam Runtime、Proton、MangoHud 或 Vulkan loader 升级后必须重新构建并运行对应
-  矩阵。通过矩阵表示“已验证兼容”，不是对未来版本的无限承诺。
+- 桌面矩阵不属于第一版兼容承诺。若未来重新进入发布范围，Steam Runtime、Proton、
+  MangoHud 或 Vulkan loader 升级后必须重新构建并运行对应矩阵。
 
 ### 场景代理 `mango-overlayd`
 
@@ -166,8 +160,8 @@ gamescope-session.target
 - systemd 正常停止会话时只转发信号并退出，不写安装状态，也不触发回退。
 - 回退系统 MangoApp 时移除项目私有库路径，避免系统二进制加载包内依赖。
 - 不依赖 Decky 前端正在打开。
-- 同一稳定启动模块还承担桌面游戏入口，但桌面游戏退出只结束该运行会话，不触发
-  MangoApp 回退，也不改变安装、更新或卸载状态。
+- 同一稳定启动模块保留实验桌面入口；正式运行时缺少桌面产物时只透传命令。该入口
+  不触发 MangoApp 回退，也不改变安装、更新或卸载状态。
 
 ### Decky 插件
 
@@ -180,8 +174,8 @@ gamescope-session.target
 - 只有确认 Decky 插件目录确实不存在时，稳定生命周期助手才执行最终卸载。
 - Decky 的“禁用插件”只停止管理界面和后端；扩展覆盖层由项目自身总开关控制。
 - 更新成功后自动切换运行时，不提供独立的“更新后台”步骤。
-- 同一个 Decky 包携带游戏模式运行时、桌面双 ABI 注入库和 Vulkan manifest；两种
-  模式随同一内容寻址修订一起验证、激活和回滚。
+- Decky 正式包只携带游戏模式运行时、代理、控制器、测试提供者和 SDK 客户端库；
+  桌面双 ABI 注入库及 Vulkan manifest 不进入活动修订。
 
 Decky Loader 当前更新流程也会调用 `_uninstall`，所以插件回调名称不能作为用户意图。详细状态机见 [lifecycle.md](./lifecycle.md)。
 
@@ -282,7 +276,7 @@ broker/      mango-overlayd 与控制器
 client/      稳定 C ABI、C++、Python 与 Rust 封装
 renderer/    共享绘制逻辑和各渲染适配器
 plugin/      Decky 前端和 Python 后端
-packaging/   Steam Runtime 4 构建、Decky 打包与 SDK 验收
+packaging/   固定 sysroot 的游戏模式构建、Decky 打包与 SDK 验收
 protocol/    版本化消息协议
 resource/    图片与 GIF 解码
 scene/       保留式场景和策略
@@ -294,6 +288,6 @@ docs/        架构、协议、生命周期、调试和 ADR
 
 ## 尚待验证
 
-1. 同一个正式 Decky 包从 KDE 桌面游戏回归到真实游戏模式的完整顺序验收。
+1. 新的 game-mode-only 正式 Decky 包完成真实游戏模式安装与显示回归。
 2. 当前无外接屏硬件，真实输出切换保留为延期人工验收项。
 3. 固定功耗真实游戏中的空载和典型场景发布性能预算。

@@ -214,8 +214,6 @@ def verify_desktop_launcher(home: Path, runtime: Path) -> None:
     library_directory = f"{runtime}/$LIB"
     expected = {
         "MANGOHUD": "1",
-        "MANGOHUD_CONFIGFILE": "/dev/null",
-        "MANGOHUD_CONFIG": "no_display=1",
         "MANGOHUD_OPENGL_LIBS": (
             f"{library_directory}/libMangoHud_opengl.so"
         ),
@@ -231,6 +229,60 @@ def verify_desktop_launcher(home: Path, runtime: Path) -> None:
     for name, value in expected.items():
         if launched.get(name) != value:
             raise RuntimeError(f"packaged desktop launcher set the wrong {name}")
+    for name in ("MANGOHUD_CONFIGFILE", "MANGOHUD_CONFIG"):
+        if name in launched:
+            raise RuntimeError(f"packaged desktop launcher unexpectedly set {name}")
+
+
+def verify_game_mode_only_runtime(home: Path, runtime: Path) -> None:
+    forbidden = (
+        runtime / "lib/libMangoHud.so",
+        runtime / "lib/libMangoHud_opengl.so",
+        runtime / "lib/libMangoHud_shim.so",
+        runtime / "lib32",
+        runtime / "share/vulkan/implicit_layer.d",
+    )
+    for path in forbidden:
+        if path.exists():
+            raise RuntimeError(
+                f"game-mode package contains a desktop injection artifact: {path}"
+            )
+
+    launcher = home / ".local/libexec/mango-overlay-decky/launcher.py"
+    environment = {
+        "HOME": str(home),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "MANGOHUD": "1",
+        "MANGOHUD_CONFIG": "fps_only",
+        "MANGO_OVERLAY_PACKAGE_TEST": "pass-through",
+    }
+    result = subprocess.run(
+        [str(launcher), "desktop", "--", "/usr/bin/env"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=environment,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"disabled desktop launcher did not pass through: {result.stderr}"
+        )
+    launched = dict(
+        line.split("=", 1) for line in result.stdout.splitlines() if "=" in line
+    )
+    for name, value in environment.items():
+        if launched.get(name) != value:
+            raise RuntimeError(f"disabled desktop launcher changed {name}")
+    for name in (
+        "MANGO_OVERLAY_SOCKET",
+        "MANGOHUD_OPENGL_LIBS",
+        "VK_IMPLICIT_LAYER_PATH",
+        "LD_PRELOAD",
+        "LD_LIBRARY_PATH",
+    ):
+        if name in launched:
+            raise RuntimeError(f"disabled desktop launcher injected {name}")
 
 
 def verify_sdk(
@@ -326,15 +378,14 @@ def main() -> int:
             raise RuntimeError("package.json version is invalid")
         lifecycle_home = temporary / "lifecycle-home"
         installed_runtime = verify_lifecycle(plugin_root, lifecycle_home, version)
-        verify_desktop_runtime(installed_runtime)
-        verify_desktop_launcher(lifecycle_home, installed_runtime)
+        verify_game_mode_only_runtime(lifecycle_home, installed_runtime)
         verify_sdk(
             options.source_root.resolve(),
             options.development_build.resolve(),
             plugin_root,
             temporary,
         )
-    print("packaged dual-mode lifecycle and C/C++/Python/Rust SDK tests passed")
+    print("packaged Game Mode lifecycle and C/C++/Python/Rust SDK tests passed")
     return 0
 
 

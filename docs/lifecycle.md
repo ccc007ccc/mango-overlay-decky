@@ -84,17 +84,16 @@ ready   -> failed -> system_fallback
 
 每份运行时清单经规范化后生成 SHA-256 修订 ID，目录以修订 ID 命名。`install.json` 分别记录对外的 `active_version` / `previous_version`、内部的 `active_runtime` / `previous_runtime` 和当前插件 generation。相同版本、相同内容的 Loader 重载复用修订且不重启；相同版本、不同内容的测试包按正常更新事务切换到新修订，旧修订仍可回滚。路径和 Decky 插件标识已经固定，清理不得根据模糊名称或目录扫描删除文件。
 
-活动修订同时拥有两种模式的文件：
+第一版活动修订只拥有游戏模式所需文件：
 
 ```text
 runtime/bin/                                  MangoApp、代理、控制器和测试提供者
-runtime/lib/                                  游戏模式依赖与 x86_64 桌面注入库
-runtime/lib32/                                i686 桌面注入库与私有依赖
-runtime/share/vulkan/implicit_layer.d/        两种 ABI 的相对路径 manifest
+runtime/lib/                                  提供者客户端库与游戏模式私有依赖
 runtime/licenses/                             随包私有库许可证
 ```
 
-双模式文件属于同一份清单和修订，不能单独更新某一种模式。
+桌面 `libMangoHud`/shim、`runtime/lib32` 和 Vulkan layer manifest 不进入正式运行时。
+它们的源码与开发工具仍保留在仓库中，但不参与安装、更新或回滚。
 
 ## 首次安装
 
@@ -103,7 +102,7 @@ runtime/licenses/                             随包私有库许可证
 1. 获取生命周期锁。
 2. 清除属于本次安装的过期待确认卸载记录。
 3. 根据清单生成运行时修订 ID，并把插件包内运行时复制到同文件系统的临时修订目录。
-4. 校验清单、文件权限、游戏模式自检、桌面双 ABI ELF 和 Vulkan manifest。
+4. 校验清单、文件权限并运行游戏模式二进制自检。
 5. 原子重命名为正式修订目录。
 6. 原子提交包含活动版本、活动修订和回滚修订的安装状态。
 7. 安装指向稳定启动助手的用户级 service drop-in。
@@ -139,24 +138,18 @@ runtime/licenses/                             随包私有库许可证
 
 项目不提供第二套“更新后台”按钮。插件包、运行时和 Decky 前端作为同一版本发布，由 Decky 更新一次完成。
 
-## 桌面游戏运行会话
+## 遗留桌面启动项
 
-安装完成后，每个 KDE Steam 游戏使用同一个启动选项：
+第一版不要求也不支持用项目启动项注入 KDE 游戏。为了让曾测试双模式包的用户安全
+更新，稳定启动器仍识别：
 
 ```text
 ~/.local/libexec/mango-overlay-decky/launcher.py desktop -- %command%
 ```
 
-稳定启动器只读取已验证的活动修订，并在 `exec` 游戏前完成以下工作：
-
-- 用 `$LIB` 为当前进程选择 `runtime/lib` 或 `runtime/lib32`。
-- 预加载项目自己的 `libMangoHud_shim.so`，并移除继承环境中冲突的同名 shim。
-- 为 Vulkan 指向包内两种 ABI 的隐式层 manifest。
-- 把 `/run/user/<uid>/mango-overlay-decky.sock` 传播给原生、Steam Runtime 和 Proton。
-- 默认使用 `no_display=1` 保持系统统计与提供者画布独立；用户显式配置优先。
-
-启动失败或游戏退出只影响该桌面运行会话。它不写安装状态、不创建卸载记录，也不
-切换活动或回滚修订。
+当活动运行时没有完整桌面实验产物时，启动器只使用继承环境原样 `exec` 游戏，不设置
+`MANGOHUD_CONFIG`、`LD_PRELOAD`、Vulkan layer 或场景 socket。该兼容行为避免遗留启动
+项阻止游戏或覆盖 Steam 原生性能统计；用户仍应删除启动项并恢复默认启动方式。
 
 ## 最终卸载
 
@@ -215,7 +208,7 @@ python3 ~/.local/libexec/mango-overlay-decky/lifecycle.py \
 | Decky Loader 重启 | 不变 | 覆盖层继续运行或按会话正常重启 |
 | 插件禁用 | 不变 | 只停止管理前后端；覆盖层保持项目总开关的既有状态 |
 | Steam 重启 | 不变 | 不清理任何文件 |
-| 桌面/游戏模式切换 | 不变 | 对应渲染器按会话启停 |
+| 桌面/游戏模式切换 | 不变 | 桌面不启动项目渲染器；进入游戏模式后按服务启动活动版本 |
 | 休眠/恢复 | 不变 | 恢复活动版本，不产生卸载记录 |
 | 关机/开机 | 不变 | 开机后继续使用活动版本 |
 | Decky 更新成功 | 切换到新版本 | 验证后热切换，失败回滚 |

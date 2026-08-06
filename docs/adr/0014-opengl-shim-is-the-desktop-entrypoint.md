@@ -1,5 +1,7 @@
 # 桌面 OpenGL 统一从 MangoHud shim 进入
 
+状态：实验实现决策；桌面渲染器当前不进入正式包，见 [ADR 0016](./0016-defer-desktop-renderer-from-first-release.md)
+
 日期：2026-08-06  
 状态：已接受
 

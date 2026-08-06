@@ -75,7 +75,7 @@ jobs:
             bash -n "${script}"
           done
 
-      - name: Configure dual-mode runtime tests
+      - name: Configure Game Mode runtime tests
         run: |
           meson setup build/ci . \
             --buildtype=debug \
@@ -93,80 +93,3 @@ jobs:
         run: |
           meson compile -C build/ci
           meson test -C build/ci --print-errorlogs --no-rebuild
-
-  i686:
-    name: i686 Vulkan and OpenGL injection libraries
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - name: Checkout with upstream submodules
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-
-      - name: Install multilib dependencies
-        run: |
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends \
-            file \
-            flatbuffers-compiler \
-            g++-multilib \
-            gcc-multilib \
-            glslang-tools \
-            libegl-dev:i386 \
-            libgif-dev:i386 \
-            libgl-dev:i386 \
-            libjpeg-dev:i386 \
-            libpng-dev:i386 \
-            libvulkan-dev:i386 \
-            libwayland-dev:i386 \
-            libwebp-dev:i386 \
-            libx11-dev:i386 \
-            libxkbcommon-dev:i386 \
-            meson \
-            ninja-build \
-            pkg-config \
-            python3-mako
-
-      - name: Configure and build i686 injection libraries
-        env:
-          CC: gcc -m32
-          CXX: g++ -m32
-          PKG_CONFIG_LIBDIR: /usr/lib/i386-linux-gnu/pkgconfig:/usr/share/pkgconfig
-        run: |
-          meson setup build/i686 . \
-            --buildtype=release \
-            --force-fallback-for=flatbuffers \
-            -Dinclude_doc=false \
-            -Dmango_overlay_decky=enabled \
-            -Dmangoapp=false \
-            -Dmangohudctl=false \
-            -Dmangoplot=disabled \
-            -Dtests=disabled \
-            -Dwith_dbus=disabled \
-            -Dwith_nvml=disabled \
-            -Dwith_xnvctrl=disabled
-          meson compile -C build/i686 \
-            MangoHud:shared_library \
-            MangoHud_opengl \
-            MangoHud_shim
-
-      - name: Verify i686 ABI and dependencies
-        run: |
-          artifacts=(
-            build/i686/src/libMangoHud.so
-            build/i686/src/libMangoHud_opengl.so
-            build/i686/src/libMangoHud_shim.so
-          )
-          for artifact in "${artifacts[@]}"; do
-            file -Lb "${artifact}" \
-              | grep -Eq 'ELF 32-bit LSB shared object, Intel (80386|i386)'
-            readelf -h "${artifact}" | grep -Eq 'Class:[[:space:]]+ELF32'
-            readelf -h "${artifact}" | grep -Eq 'Machine:[[:space:]]+Intel 80386'
-            if ldd "${artifact}" | grep -F 'not found'; then
-              exit 1
-            fi
-          done
-          grep -Fq 'VK_LAYER_MANGOHUD_overlay_x86' \
-            build/i686/src/MangoHud.x86.json

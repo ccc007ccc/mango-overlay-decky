@@ -1,7 +1,7 @@
 # ADR 0015：第一版同时支持游戏模式和桌面游戏
 
 日期：2026-08-06
-状态：已接受
+状态：已被 [ADR 0016](./0016-defer-desktop-renderer-from-first-release.md) 取代
 取代：[ADR 0001](./0001-mvp-scope.md)
 
 ## 背景
