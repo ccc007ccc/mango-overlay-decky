@@ -18,12 +18,18 @@ from mango_overlay_decky.lifecycle import (
     LifecycleError,
     LifecycleManager,
     LifecyclePaths,
+    LifecycleRuntimeOperations,
     MAX_PLUGIN_DIRECTORIES,
     UNINSTALL_GRACE_SECONDS,
     _default_run,
     _default_run_quick,
     _plugin_directory_is_trusted,
     _plugin_file_is_trusted,
+)
+from mango_overlay_decky.coordinator import (
+    CoordinatorPaths,
+    RuntimeClaim,
+    RuntimeCoordinator,
 )
 
 
@@ -129,8 +135,10 @@ def make_plugin(parent: Path, version: str, marker: str) -> Path:
     )
     helper = plugin / "py_modules/mango_overlay_decky/lifecycle.py"
     launcher = plugin / "py_modules/mango_overlay_decky/launcher.py"
+    coordinator = plugin / "py_modules/mango_overlay_decky/coordinator.py"
     write_file(helper, f"# lifecycle helper {marker}\n".encode(), 0o644)
     write_file(launcher, f"# launcher {marker}\n".encode(), 0o644)
+    write_file(coordinator, f"# coordinator {marker}\n".encode(), 0o644)
     (plugin / "plugin.json").write_text(
         json.dumps({"name": "Mango Overlay Decky"}),
         encoding="utf-8",
@@ -271,6 +279,20 @@ class LifecycleTests(unittest.TestCase):
         command_count = len(self.systemctl.commands)
         reloaded = self.manager.activate(plugin, "0.1.0", "generation-two")
         self.assertEqual(reloaded.generation, "generation-two")
+        self.assertEqual(len(self.systemctl.commands), command_count)
+
+    def test_refresh_active_generation_does_not_restart_services(self) -> None:
+        plugin = make_plugin(self.root, "0.1.0", "first")
+        initial = self.manager.activate(plugin, "0.1.0", "generation-one")
+        command_count = len(self.systemctl.commands)
+
+        refreshed = self.manager.refresh_active_generation(
+            initial.active_runtime,
+            "generation-two",
+        )
+
+        self.assertEqual(refreshed.generation, "generation-two")
+        self.assertEqual(self.manager.status().generation, "generation-two")
         self.assertEqual(len(self.systemctl.commands), command_count)
 
     def test_same_version_repack_is_an_atomic_runtime_update(self) -> None:
@@ -706,6 +728,45 @@ class LifecycleTests(unittest.TestCase):
         for unit in self.manager._unit_paths():
             self.assertFalse(unit.exists())
 
+    def test_interrupted_coordinated_activation_retains_prepared_candidate(self) -> None:
+        first_plugin = make_plugin(self.root, "0.1.0", "first")
+        second_plugin = make_plugin(self.root, "0.2.0", "second")
+        first_state = self.manager.activate(
+            first_plugin, "0.1.0", "generation-one"
+        )
+        second = self.manager.prepare_runtime_candidate(second_plugin, "0.2.0")
+        self.assertIsNotNone(first_state.active_runtime)
+        self.systemctl.gamescope_active = True
+        self.systemctl.crash_on_broker_restart = True
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.manager.activate_prepared_runtime(
+                second.content_revision,
+                plugin_root=second_plugin,
+                version="0.2.0",
+                generation="generation-two",
+                verify=False,
+            )
+
+        self.assertTrue(self.paths.transaction_file.exists())
+        transaction = json.loads(
+            self.paths.transaction_file.read_text(encoding="utf-8")
+        )
+        self.assertTrue(transaction["retain_candidate"])
+        self.assertTrue((self.paths.versions / second.content_revision).is_dir())
+
+        recovered = self.manager.activate_prepared_runtime(
+            first_state.active_runtime,
+            plugin_root=first_plugin,
+            version="0.1.0",
+            generation="generation-three",
+            verify=False,
+        )
+
+        self.assertEqual(recovered.active_runtime, first_state.active_runtime)
+        self.assertFalse(self.paths.transaction_file.exists())
+        self.assertTrue((self.paths.versions / second.content_revision).is_dir())
+
     def test_unsafe_cleanup_data_does_not_block_system_restore(self) -> None:
         plugin = make_plugin(self.root, "0.1.0", "first")
         self.manager.activate(plugin, "0.1.0", "generation-one")
@@ -725,6 +786,182 @@ class LifecycleTests(unittest.TestCase):
         self.assertTrue(
             (self.paths.systemd_user_root / "mango-overlay-cleanup.timer").exists()
         )
+
+    def test_coordinator_verifies_only_the_candidate_it_selects(self) -> None:
+        low_plugin = make_plugin(self.root, "0.1.0", "low")
+        high_plugin = make_plugin(self.root, "0.2.0", "high")
+        low = self.manager.prepare_runtime_candidate(low_plugin, "0.1.0")
+        high = self.manager.prepare_runtime_candidate(high_plugin, "0.2.0")
+        self.verified.clear()
+
+        roots = {
+            low.content_revision: low_plugin,
+            high.content_revision: high_plugin,
+        }
+        versions = {
+            low.content_revision: "0.1.0",
+            high.content_revision: "0.2.0",
+        }
+
+        class Operations:
+            def activate(inner_self, candidate):
+                self.manager.activate_prepared_runtime(
+                    candidate.content_revision,
+                    plugin_root=roots[candidate.content_revision],
+                    version=versions[candidate.content_revision],
+                    generation="generation-00000001",
+                )
+
+            def restore_system(inner_self):
+                self.manager.restore_system_mangoapp()
+
+        coordinator = RuntimeCoordinator(
+            CoordinatorPaths.for_home(self.home), Operations()
+        )
+        coordinator.register(RuntimeClaim("product.low", "generation-00000001", low))
+        self.assertEqual(
+            [version for _path, version in self.verified], ["0.1.0"]
+        )
+        self.verified.clear()
+        coordinator.register(RuntimeClaim("product.high", "generation-00000002", high))
+        self.assertEqual(
+            [version for _path, version in self.verified], ["0.2.0"]
+        )
+        self.verified.clear()
+
+        # A lower claim is retained in the durable registry but cannot cause
+        # another self-test or downgrade the active revision.
+        coordinator.register(
+            RuntimeClaim("product.lower-again", "generation-00000003", low)
+        )
+        self.assertEqual(self.verified, [])
+        self.assertEqual(coordinator.status().active_revision, high.content_revision)
+
+    def test_finalizing_one_coordinated_claim_keeps_the_shared_core(self) -> None:
+        low_parent = self.root / "low"
+        high_parent = self.root / "high"
+        low_parent.mkdir()
+        high_parent.mkdir()
+        low_plugin = make_plugin(low_parent, "0.1.0", "low")
+        high_plugin = make_plugin(high_parent, "0.2.0", "high")
+        low = self.manager.prepare_runtime_candidate(low_plugin, "0.1.0")
+        high = self.manager.prepare_runtime_candidate(high_plugin, "0.2.0")
+
+        roots = {low.content_revision: low_plugin, high.content_revision: high_plugin}
+        versions = {low.content_revision: "0.1.0", high.content_revision: "0.2.0"}
+
+        class Operations:
+            def ensure_candidate(inner_self, candidate):
+                self.manager.ensure_prepared_runtime(candidate.content_revision)
+
+            def activate(inner_self, candidate):
+                self.manager.activate_prepared_runtime(
+                    candidate.content_revision,
+                    plugin_root=roots[candidate.content_revision],
+                    version=versions[candidate.content_revision],
+                    generation=(
+                        "generation-low-0001"
+                        if candidate.content_revision == low.content_revision
+                        else "generation-high-0001"
+                    ),
+                )
+
+            def restore_system(inner_self):
+                self.manager.restore_system_mangoapp()
+
+        coordinator = RuntimeCoordinator(
+            CoordinatorPaths.for_home(self.home), Operations()
+        )
+        coordinator.register(
+            RuntimeClaim("product.low", "generation-low-0001", low)
+        )
+        coordinator.register(
+            RuntimeClaim("product.high", "generation-high-0001", high)
+        )
+        coordinator_token = coordinator.mark_pending_removal(
+            "product.high", "generation-high-0001"
+        )
+        self.manager.mark_pending_uninstall(
+            high_plugin,
+            "generation-high-0001",
+            coordinator_token=coordinator_token,
+            coordinator_product_id="product.high",
+        )
+        shutil.rmtree(high_plugin)
+        self.now += UNINSTALL_GRACE_SECONDS + 0.1
+
+        self.assertTrue(self.manager.finalize_pending_uninstall())
+        status = coordinator.status()
+        self.assertEqual(status.active_revision, low.content_revision)
+        self.assertEqual(len(status.claims), 1)
+        self.assertEqual(status.claims[0].product_id, "product.low")
+        self.assertTrue(self.paths.mangoapp_dropin.exists())
+        self.assertEqual(self.manager.status().generation, "generation-low-0001")
+        self.assertTrue((self.paths.versions / low.content_revision).is_dir())
+
+    def test_non_active_coordinated_claim_can_arm_uninstall(self) -> None:
+        low_parent = self.root / "low"
+        high_parent = self.root / "high"
+        low_parent.mkdir()
+        high_parent.mkdir()
+        low_plugin = make_plugin(low_parent, "0.1.0", "low")
+        high_plugin = make_plugin(high_parent, "0.2.0", "high")
+        low = self.manager.prepare_runtime_candidate(low_plugin, "0.1.0")
+        high = self.manager.prepare_runtime_candidate(high_plugin, "0.2.0")
+
+        roots = {low.content_revision: low_plugin, high.content_revision: high_plugin}
+        versions = {low.content_revision: "0.1.0", high.content_revision: "0.2.0"}
+
+        class Operations:
+            def ensure_candidate(inner_self, candidate):
+                self.manager.ensure_prepared_runtime(candidate.content_revision)
+
+            def activate(inner_self, candidate):
+                self.manager.activate_prepared_runtime(
+                    candidate.content_revision,
+                    plugin_root=roots[candidate.content_revision],
+                    version=versions[candidate.content_revision],
+                    generation=(
+                        "generation-low-0001"
+                        if candidate.content_revision == low.content_revision
+                        else "generation-high-0001"
+                    ),
+                )
+
+            def restore_system(inner_self):
+                self.manager.restore_system_mangoapp()
+
+        coordinator = RuntimeCoordinator(
+            CoordinatorPaths.for_home(self.home), Operations()
+        )
+        coordinator.register(
+            RuntimeClaim("product.low", "generation-low-0001", low)
+        )
+        coordinator.register(
+            RuntimeClaim("product.high", "generation-high-0001", high)
+        )
+        token = coordinator.mark_pending_removal(
+            "product.low", "generation-low-0001"
+        )
+
+        # The high revision is active, so the low product must not be rejected
+        # merely because the single lifecycle state records high's generation.
+        self.manager.mark_pending_uninstall(
+            low_plugin,
+            "generation-low-0001",
+            coordinator_token=token,
+            coordinator_product_id="product.low",
+        )
+        shutil.rmtree(low_plugin)
+        self.now += UNINSTALL_GRACE_SECONDS + 0.1
+
+        self.assertTrue(self.manager.finalize_pending_uninstall())
+        status = coordinator.status()
+        self.assertEqual(
+            [claim.product_id for claim in status.claims], ["product.high"]
+        )
+        self.assertEqual(status.active_revision, high.content_revision)
+        self.assertTrue((self.paths.versions / high.content_revision).is_dir())
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@
   "author": "ccc007ccc",
   "flags": [],
   "api_version": 1,
+  "mango_core_version": "1.0.0",
   "publish": {
     "tags": ["utility"],
     "description": "Shared drawing canvases for the SteamOS overlay."

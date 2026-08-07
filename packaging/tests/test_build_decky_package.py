@@ -119,6 +119,28 @@ class DeckyPackageTests(unittest.TestCase):
         ).read_bytes()
         self.assertEqual(first, second)
 
+    def test_runtime_manifest_keeps_core_version_separate_from_plugin_version(self) -> None:
+        (self.source / "plugin/plugin.json").write_text(
+            json.dumps(
+                {
+                    "name": "Mango Overlay Decky",
+                    "mango_core_version": "3.2.1",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        archive_path = build_package(
+            self.source, self.build, self.output, source_date_epoch=1_700_000_000
+        )
+
+        with zipfile.ZipFile(archive_path) as archive:
+            manifest = json.loads(
+                archive.read(f"{PLUGIN_DIRECTORY}/runtime/manifest.json")
+            )
+        self.assertEqual(manifest["version"], "0.1.0")
+        self.assertEqual(manifest["core_version"], "3.2.1")
+
     def test_missing_runtime_input_fails_without_an_archive(self) -> None:
         (self.build / RUNTIME_FILES[0][1]).unlink()
         with self.assertRaisesRegex(PackageError, "Required package input is missing"):

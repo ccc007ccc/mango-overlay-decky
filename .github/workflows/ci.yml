@@ -66,6 +66,14 @@ jobs:
           pnpm --dir plugin install --frozen-lockfile
           pnpm --dir plugin verify
 
+      - name: Verify Decky lifecycle and package helpers
+        run: |
+          PYTHONPATH=plugin/py_modules python3 -m unittest discover \
+            -s plugin/tests -p 'test_*.py'
+          PYTHONPATH=packaging python3 -m unittest discover \
+            -s packaging/tests -p 'test_*.py'
+          python3 -m compileall -q plugin/py_modules packaging packaging/tests
+
       - name: Check shell and repository hygiene
         run: |
           git diff --check

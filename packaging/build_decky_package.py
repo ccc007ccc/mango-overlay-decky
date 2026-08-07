@@ -12,11 +12,13 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Iterable, Sequence
+import re
 
 
 PLUGIN_DIRECTORY = "mango-overlay-decky"
 PLUGIN_NAME = "Mango Overlay Decky"
 DEFAULT_SOURCE_DATE_EPOCH = 315532800
+CORE_VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
 class PackageError(RuntimeError):
@@ -51,6 +53,11 @@ PLUGIN_FILES = (
     (
         "py_modules/mango_overlay_decky/lifecycle.py",
         "plugin/py_modules/mango_overlay_decky/lifecycle.py",
+        0o644,
+    ),
+    (
+        "py_modules/mango_overlay_decky/coordinator.py",
+        "plugin/py_modules/mango_overlay_decky/coordinator.py",
         0o644,
     ),
 )
@@ -107,7 +114,7 @@ def _read_json(path: Path) -> dict[str, object]:
     return value
 
 
-def _package_version(source_root: Path) -> str:
+def _package_metadata(source_root: Path) -> tuple[str, str]:
     plugin = _read_json(source_root / "plugin/plugin.json")
     package = _read_json(source_root / "plugin/package.json")
     version = package.get("version")
@@ -117,12 +124,23 @@ def _package_version(source_root: Path) -> str:
         raise PackageError("package.json contains an invalid version")
     if any(character not in "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz._+-" for character in version):
         raise PackageError("package.json version is unsafe for an archive name")
-    return version
+    core_version = plugin.get("mango_core_version", version)
+    if (
+        not isinstance(core_version, str)
+        or CORE_VERSION.fullmatch(core_version) is None
+    ):
+        raise PackageError("plugin.json contains an invalid mango_core_version")
+    return version, core_version
+
+
+def _package_version(source_root: Path) -> str:
+    return _package_metadata(source_root)[0]
 
 
 def _runtime_manifest(
     version: str,
     runtime_files: Iterable[PackageFile],
+    core_version: str | None = None,
 ) -> bytes:
     entries = []
     for file in sorted(runtime_files, key=lambda item: item.archive_path):
@@ -136,7 +154,12 @@ def _runtime_manifest(
                 "mode": file.mode,
             }
         )
-    manifest = {"schema": 1, "version": version, "files": entries}
+    manifest = {
+        "schema": 1,
+        "version": version,
+        "core_version": core_version or version,
+        "files": entries,
+    }
     return (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
 
@@ -164,7 +187,7 @@ def _vulkan_layer_manifest(layer_name: str, library_path: str) -> bytes:
 def collect_package_files(source_root: Path, build_root: Path) -> tuple[str, list[PackageFile]]:
     source_root = source_root.resolve()
     build_root = build_root.resolve()
-    version = _package_version(source_root)
+    version, core_version = _package_metadata(source_root)
     files: list[PackageFile] = []
     for archive_path, source_path, mode in PLUGIN_FILES:
         path = source_root / source_path
@@ -191,7 +214,7 @@ def collect_package_files(source_root: Path, build_root: Path) -> tuple[str, lis
             "runtime/manifest.json",
             None,
             0o644,
-            _runtime_manifest(version, runtime_files),
+            _runtime_manifest(version, runtime_files, core_version),
         )
     )
 

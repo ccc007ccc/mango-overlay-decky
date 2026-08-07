@@ -2,7 +2,7 @@
 
 面向 SteamOS 的共享覆盖层绘制平台。第三方程序可以通过稳定接口在指定坐标绘制文字、图形、图片和动画，不需要各自实现 Gamescope 或 MangoHud 集成。
 
-当前已完成共享数据面、基础绘制、图片/GIF、C/C++/Python/Rust 提供者 SDK，以及 Decky 安装、原子更新、回滚和延迟确认卸载。第一版只发布使用 MangoApp/Gamescope 的游戏模式渲染器，项目仍处于首版设备验收阶段。
+当前已完成共享数据面、基础绘制、图片/GIF、C/C++/Python/Rust 提供者 SDK，以及 Decky 安装、原子更新、回滚、共享 Mango 核心仲裁和延迟确认卸载。第一版只发布使用 MangoApp/Gamescope 的游戏模式渲染器，项目仍处于首版设备验收阶段。
 
 ## 范围
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from mango_overlay_decky.lifecycle import LifecycleError, LifecycleState
+from mango_overlay_decky.coordinator import CoordinatorOutcome, RuntimeCandidate
 
 
 def load_plugin(fake_decky: types.ModuleType):
@@ -38,6 +39,41 @@ def fake_decky() -> types.ModuleType:
 
 
 class PluginTests(unittest.IsolatedAsyncioTestCase):
+    async def test_main_registers_a_prepared_candidate_with_the_shared_coordinator(self) -> None:
+        decky = fake_decky()
+        module = load_plugin(decky)
+        candidate = RuntimeCandidate.create(
+            core_version="1.0.0",
+            content_revision="a" * 64,
+            runtime_ref="a" * 64,
+        )
+        manager = types.SimpleNamespace(
+            prepare_runtime_candidate=Mock(return_value=candidate),
+            status=Mock(return_value=LifecycleState("0.1.0", None, "a" * 32)),
+        )
+        coordinator = types.SimpleNamespace(
+            register=Mock(
+                return_value=CoordinatorOutcome(
+                    "activated", candidate.content_revision, candidate
+                )
+            )
+        )
+        with (
+            patch.object(module, "LifecycleManager", return_value=manager),
+            patch.object(module, "RuntimeCoordinator", return_value=coordinator),
+            patch.object(module.secrets, "token_hex", return_value="a" * 32),
+        ):
+            plugin = module.Plugin()
+            await plugin._main()
+
+        manager.prepare_runtime_candidate.assert_called_once_with(
+            Path("/plugin"), "0.1.0"
+        )
+        coordinator.register.assert_called_once()
+        claim = coordinator.register.call_args.args[0]
+        self.assertEqual(claim.product_id, module.PRODUCT_ID)
+        self.assertEqual(claim.candidate, candidate)
+
     async def test_main_activates_one_generation(self) -> None:
         decky = fake_decky()
         module = load_plugin(decky)

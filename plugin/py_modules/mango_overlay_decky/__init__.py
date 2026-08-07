@@ -3,6 +3,19 @@ from .lifecycle import (
     LifecycleManager,
     LifecyclePaths,
     LifecycleState,
+    LifecycleRuntimeOperations,
+)
+from .coordinator import (
+    CandidateSelection,
+    CoordinatorError,
+    CoordinatorOutcome,
+    CoordinatorPaths,
+    CoordinatorStatus,
+    CoreVersion,
+    RuntimeCandidate,
+    RuntimeClaim,
+    RuntimeCoordinator,
+    select_candidate,
 )
 
 __all__ = [
@@ -10,4 +23,15 @@ __all__ = [
     "LifecycleManager",
     "LifecyclePaths",
     "LifecycleState",
+    "LifecycleRuntimeOperations",
+    "CandidateSelection",
+    "CoordinatorError",
+    "CoordinatorOutcome",
+    "CoordinatorPaths",
+    "CoordinatorStatus",
+    "CoreVersion",
+    "RuntimeCandidate",
+    "RuntimeClaim",
+    "RuntimeCoordinator",
+    "select_candidate",
 ]

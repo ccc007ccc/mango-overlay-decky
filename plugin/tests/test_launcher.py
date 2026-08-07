@@ -8,9 +8,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from mango_overlay_decky import launcher
+from mango_overlay_decky.coordinator import CoordinatorOutcome
 
 
 class LauncherTests(unittest.TestCase):
@@ -92,6 +94,26 @@ class LauncherTests(unittest.TestCase):
 
         with patch.object(launcher.Path, "home", return_value=self.home):
             self.assertEqual(launcher.active_binary("mangoapp"), binary)
+
+    def test_coordinator_active_pointer_is_authoritative_over_install_state(self) -> None:
+        revision = "c" * 64
+        runtime = (
+            self.home
+            / ".local/share/mango-overlay-decky/runtime/versions"
+            / revision
+        )
+        runtime.mkdir(parents=True)
+        coordinator_state = (
+            self.home / ".local/share/mango-overlay-decky/coordinator/state.json"
+        )
+        coordinator_state.parent.mkdir(parents=True, exist_ok=True)
+        coordinator_state.write_text(
+            json.dumps({"schema": 1, "active_revision": revision, "claims": []}),
+            encoding="utf-8",
+        )
+        coordinator_state.chmod(0o600)
+        with patch.object(launcher.Path, "home", return_value=self.home):
+            self.assertEqual(launcher.active_runtime(), runtime)
 
     def test_unsafe_runtime_binary_is_rejected(self) -> None:
         binary = self.runtime / "bin/mango-overlayctl"
@@ -326,6 +348,58 @@ class LauncherTests(unittest.TestCase):
         ):
             self.assertEqual(launcher.main(), 64)
         execute.assert_not_called()
+
+    def test_coordinator_status_is_a_bounded_json_command(self) -> None:
+        candidate = launcher.RuntimeCandidate.create(
+            core_version="1.0.0",
+            content_revision="a" * 64,
+            runtime_ref="a" * 64,
+        )
+        claim = launcher.RuntimeClaim("product.one", "generation-00000001", candidate)
+        fake_status = SimpleNamespace(
+            active_revision=candidate.content_revision,
+            known_good_revision=candidate.content_revision,
+            failed_revisions=(),
+            last_error=None,
+            claims=(claim,),
+        )
+        fake_coordinator = SimpleNamespace(status=lambda: fake_status)
+        with patch.object(
+            launcher, "_coordinator_instance", return_value=(fake_coordinator, None)
+        ), patch("builtins.print") as output:
+            result = launcher.coordinator_cli(["status"])
+
+        self.assertEqual(result, 0)
+        self.assertIn('"active_revision":"' + "a" * 64, output.call_args.args[0])
+
+    def test_coordinator_register_uses_core_version_not_product_version(self) -> None:
+        fake_coordinator = SimpleNamespace(
+            register=lambda claim: CoordinatorOutcome(
+                "activated", claim.candidate.content_revision, claim.candidate
+            )
+        )
+        with patch.object(
+            launcher, "_coordinator_instance", return_value=(fake_coordinator, None)
+        ), patch("builtins.print") as printed:
+            result = launcher.coordinator_cli(
+                [
+                    "register",
+                    "--product-id",
+                    "heart-rate",
+                    "--generation",
+                    "generation-00000001",
+                    "--core-version",
+                    "3.2.1",
+                    "--content-revision",
+                    "b" * 64,
+                    "--runtime-ref",
+                    "b" * 64,
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        payload = json.loads(printed.call_args.args[0])
+        self.assertEqual(payload["candidate"]["core_version"], "3.2.1")
 
 
 if __name__ == "__main__":

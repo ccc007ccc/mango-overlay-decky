@@ -15,7 +15,10 @@ import time
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterator, Protocol, Sequence
+from typing import Callable, Iterator, Protocol, Sequence, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .coordinator import RuntimeCandidate
 
 
 PLUGIN_NAME = "Mango Overlay Decky"
@@ -78,6 +81,85 @@ class PreparedRuntime:
     path: Path
     runtime_id: str
     created: bool
+
+
+class LifecycleRuntimeOperations:
+    """Bridge coordinator activation to the lifecycle transaction seam.
+
+    The coordinator never receives a plugin path or executes a candidate.  A
+    product prepares its immutable runtime first, then this adapter resolves
+    the bounded content revision through ``LifecycleManager`` and performs the
+    one actual activation transaction.
+    """
+
+    def __init__(
+        self,
+        manager: "LifecycleManager",
+        *,
+        plugin_root: Path | None,
+        plugin_version: str | None,
+        generation: str,
+    ) -> None:
+        self.manager = manager
+        self.plugin_root = plugin_root
+        self.plugin_version = plugin_version
+        self.generation = generation
+
+    def activate(self, candidate: "RuntimeCandidate") -> None:
+        if candidate.runtime_ref != candidate.content_revision:
+            raise LifecycleError(
+                "invalid_runtime_ref",
+                "Runtime candidate reference is not its content revision",
+            )
+        self.manager.activate_prepared_runtime(
+            candidate.content_revision,
+            plugin_root=self.plugin_root,
+            version=self.plugin_version,
+            generation=self.generation,
+            verify=False,
+        )
+
+    def ensure_candidate(self, candidate: "RuntimeCandidate") -> None:
+        if candidate.runtime_ref != candidate.content_revision:
+            raise LifecycleError(
+                "invalid_runtime_ref",
+                "Runtime candidate reference is not its content revision",
+            )
+        self.manager.ensure_prepared_runtime(candidate.content_revision)
+
+    def verify_candidate(self, candidate: "RuntimeCandidate") -> None:
+        if candidate.runtime_ref != candidate.content_revision:
+            raise LifecycleError(
+                "invalid_runtime_ref",
+                "Runtime candidate reference is not its content revision",
+            )
+        self.manager.verify_prepared_runtime(candidate.content_revision)
+
+    def restore_system(self) -> None:
+        self.manager.restore_system_mangoapp()
+
+    def refresh_generation(self, candidate: "RuntimeCandidate") -> None:
+        """Record a same-product reload without restarting the renderer."""
+
+        if candidate.runtime_ref != candidate.content_revision:
+            raise LifecycleError(
+                "invalid_runtime_ref",
+                "Runtime candidate reference is not its content revision",
+            )
+        self.manager.refresh_active_generation(
+            candidate.content_revision,
+            self.generation,
+        )
+
+    def current_active_revision(self) -> str | None:
+        """Expose only the legacy active pointer for coordinator bootstrap."""
+
+        return self.manager.status().active_runtime
+
+    def current_active_candidate(self) -> "RuntimeCandidate" | None:
+        """Expose bounded metadata for a legacy active runtime."""
+
+        return self.manager.active_runtime_candidate()
 
 
 @dataclass(frozen=True)
@@ -314,6 +396,62 @@ class LifecycleManager:
         state = self._read_state()
         return state or LifecycleState(None, None, "", None, None)
 
+    def refresh_active_generation(
+        self, runtime_id: str, generation: str
+    ) -> LifecycleState:
+        """Refresh the owning product generation without changing the runtime."""
+
+        self._validate_generation(generation)
+        if not isinstance(runtime_id, str) or re.fullmatch(
+            r"[a-f0-9]{64}", runtime_id
+        ) is None:
+            raise LifecycleError("invalid_runtime", "Runtime revision is invalid")
+        with self._locked():
+            self._recover_incomplete_locked()
+            state = self._read_state()
+            if state is None or state.active_runtime != runtime_id:
+                raise LifecycleError(
+                    "active_runtime_changed",
+                    "The shared active runtime changed before generation refresh",
+                )
+            refreshed = LifecycleState(
+                active_version=state.active_version,
+                previous_version=state.previous_version,
+                generation=generation,
+                active_runtime=state.active_runtime,
+                previous_runtime=state.previous_runtime,
+            )
+            self._write_state(refreshed)
+            if self._path_exists(self.paths.pending_uninstall_file):
+                self._unlink_if_exists(self.paths.pending_uninstall_file)
+                self._stop_cleanup_timer()
+            return refreshed
+
+    def active_runtime_candidate(self) -> "RuntimeCandidate" | None:
+        """Read the active runtime manifest without running its binaries."""
+
+        try:
+            from .coordinator import RuntimeCandidate
+        except ImportError:  # launcher/lifecycle helpers are also flat files
+            from coordinator import RuntimeCandidate  # type: ignore[no-redef]
+
+        state = self.status()
+        if state.active_runtime is None:
+            return None
+        runtime = self.ensure_prepared_runtime(state.active_runtime)
+        manifest = self._read_json(runtime / "manifest.json", 1024 * 1024)
+        version = manifest.get("version")
+        core_version = manifest.get("core_version", version)
+        if not isinstance(version, str) or not isinstance(core_version, str):
+            raise LifecycleError(
+                "invalid_core_version", "Active runtime manifest is invalid"
+            )
+        return RuntimeCandidate.create(
+            core_version=core_version,
+            content_revision=state.active_runtime,
+            runtime_ref=state.active_runtime,
+        )
+
     def test_provider_active(self) -> bool:
         return self._unit_active("mango-overlay-test-provider.service")
 
@@ -345,6 +483,114 @@ class LifecycleManager:
                         "System MangoApp did not return after restoring its unit",
                     )
 
+    def prepare_runtime_candidate(
+        self,
+        plugin_root: Path,
+        version: str,
+    ) -> "RuntimeCandidate":
+        """Copy and verify a product runtime without changing the active one."""
+
+        try:
+            from .coordinator import RuntimeCandidate
+        except ImportError:  # launcher/lifecycle helpers are also flat files
+            from coordinator import RuntimeCandidate  # type: ignore[no-redef]
+
+        self._validate_version(version)
+        plugin_root = plugin_root.absolute()
+        self._validate_plugin(plugin_root, version)
+        with self._locked():
+            self._recover_incomplete_locked()
+            prepared: PreparedRuntime | None = None
+            try:
+                prepared = self._prepare_runtime(plugin_root, version)
+                manifest = self._read_json(
+                    prepared.path / "manifest.json", 1024 * 1024
+                )
+                core_version = manifest.get("core_version", version)
+                if not isinstance(core_version, str):
+                    raise LifecycleError(
+                        "invalid_core_version", "Runtime manifest core version is invalid"
+                    )
+                return RuntimeCandidate.create(
+                    core_version=core_version,
+                    content_revision=prepared.runtime_id,
+                    runtime_ref=prepared.runtime_id,
+                )
+            except Exception:
+                if prepared is not None and prepared.created:
+                    self._remove_owned_tree(prepared.path)
+                raise
+
+    def activate_prepared_runtime(
+        self,
+        runtime_id: str,
+        *,
+        plugin_root: Path | None,
+        version: str | None,
+        generation: str,
+        verify: bool = True,
+    ) -> LifecycleState:
+        """Activate an already prepared immutable revision.
+
+        ``runtime_id`` is deliberately restricted to the content-addressed
+        directory name.  ``plugin_root`` is used only to refresh the helper
+        files during a product registration; launcher retries can pass
+        ``None`` and use the already installed helper directory.
+        """
+
+        self._validate_generation(generation)
+        if not isinstance(runtime_id, str) or re.fullmatch(r"[a-f0-9]{64}", runtime_id) is None:
+            raise LifecycleError("invalid_runtime", "Runtime revision is invalid")
+        if plugin_root is not None:
+            plugin_root = plugin_root.absolute()
+            if version is None:
+                raise LifecycleError("invalid_version", "Plugin version is required")
+            self._validate_version(version)
+            self._validate_plugin(plugin_root, version)
+        with self._locked():
+            self._recover_incomplete_locked()
+            runtime = self.paths.versions / runtime_id
+            manifest = self._read_json(runtime / "manifest.json", 1024 * 1024)
+            manifest_version = manifest.get("version")
+            if not isinstance(manifest_version, str):
+                raise LifecycleError("invalid_manifest", "Prepared runtime manifest is invalid")
+            entries = self._validate_manifest_entries(manifest.get("files", []))
+            self._verify_runtime_directory(runtime, manifest_version, entries)
+            if verify:
+                self._verify_runtime(runtime, manifest_version)
+            activation_version = version or manifest_version
+            return self._activate_prepared_locked(
+                PreparedRuntime(runtime, runtime_id, False),
+                plugin_root,
+                activation_version,
+                generation,
+                retain_candidates=True,
+            )
+
+    def ensure_prepared_runtime(self, runtime_id: str) -> Path:
+        """Cheap structural validation used for every registered claim."""
+
+        if not isinstance(runtime_id, str) or re.fullmatch(r"[a-f0-9]{64}", runtime_id) is None:
+            raise LifecycleError("invalid_runtime", "Runtime revision is invalid")
+        runtime = self.paths.versions / runtime_id
+        manifest = self._read_json(runtime / "manifest.json", 1024 * 1024)
+        version = manifest.get("version")
+        if not isinstance(version, str):
+            raise LifecycleError("invalid_manifest", "Prepared runtime manifest is invalid")
+        entries = self._validate_manifest_entries(manifest.get("files", []))
+        self._verify_runtime_directory(runtime, version, entries)
+        return runtime
+
+    def verify_prepared_runtime(self, runtime_id: str) -> None:
+        """Run the expensive self-test for one structurally valid revision."""
+
+        runtime = self.ensure_prepared_runtime(runtime_id)
+        manifest = self._read_json(runtime / "manifest.json", 1024 * 1024)
+        version = manifest.get("version")
+        if not isinstance(version, str):
+            raise LifecycleError("invalid_manifest", "Prepared runtime manifest is invalid")
+        self._verify_runtime(runtime, version)
+
     def activate(
         self,
         plugin_root: Path,
@@ -367,125 +613,173 @@ class LifecycleManager:
                 if prepared is not None and prepared.created:
                     self._remove_owned_tree(prepared.path)
                 raise
-            runtime_id = prepared.runtime_id
-
-            integration_snapshot = self._capture_integration_files()
-            same_runtime = (
-                prior is not None and prior.active_runtime == runtime_id
+            return self._activate_prepared_locked(
+                prepared,
+                plugin_root,
+                version,
+                generation,
+                retain_candidates=False,
             )
-            gamescope_was_active = not same_runtime and self._gamescope_active()
-            test_provider_was_active = not same_runtime and self.test_provider_active()
-            transaction = {
-                "schema": STATE_SCHEMA,
-                "candidate": runtime_id,
-                "prior": (
-                    {"schema": STATE_SCHEMA, **asdict(prior)}
-                    if prior is not None
-                    else None
+
+    def _activate_prepared_locked(
+        self,
+        prepared: PreparedRuntime,
+        plugin_root: Path | None,
+        version: str,
+        generation: str,
+        *,
+        retain_candidates: bool,
+    ) -> LifecycleState:
+        """Run one atomic activation transaction; caller holds lifecycle lock."""
+
+        prior = self._read_state()
+        runtime_id = prepared.runtime_id
+        integration_snapshot = self._capture_integration_files()
+        same_runtime = prior is not None and prior.active_runtime == runtime_id
+        gamescope_was_active = not same_runtime and self._gamescope_active()
+        test_provider_was_active = not same_runtime and self.test_provider_active()
+        transaction = {
+            "schema": STATE_SCHEMA,
+            "candidate": runtime_id,
+            "retain_candidate": retain_candidates,
+            "prior": (
+                {"schema": STATE_SCHEMA, **asdict(prior)}
+                if prior is not None
+                else None
+            ),
+            "integration": integration_snapshot,
+        }
+
+        try:
+            self._write_json(self.paths.transaction_file, transaction)
+            integration_changed = self._install_integration_files(plugin_root)
+            state = LifecycleState(
+                active_version=version,
+                active_runtime=runtime_id,
+                previous_version=(
+                    prior.previous_version
+                    if same_runtime
+                    else prior.active_version if prior is not None else None
                 ),
-                "integration": integration_snapshot,
-            }
-
-            try:
-                self._write_json(self.paths.transaction_file, transaction)
-                integration_changed = self._install_integration_files(plugin_root)
-                state = LifecycleState(
-                    active_version=version,
-                    active_runtime=runtime_id,
-                    previous_version=(
-                        prior.previous_version
-                        if same_runtime
-                        else prior.active_version if prior is not None else None
-                    ),
-                    previous_runtime=(
-                        prior.previous_runtime
-                        if same_runtime
-                        else prior.active_runtime if prior is not None else None
-                    ),
-                    generation=generation,
-                )
-                self._write_state(state)
-                if integration_changed:
-                    self._reload_and_enable_integration()
-                if not same_runtime:
-                    self._checked_systemctl("try-restart", "mango-overlayd.service")
-                    if test_provider_was_active:
-                        self._checked_systemctl(
-                            "restart", "mango-overlay-test-provider.service"
-                        )
-                    if gamescope_was_active:
-                        self._checked_systemctl(
-                            "restart", "gamescope-mangoapp.service"
-                        )
-                        if not self._gamescope_active():
-                            raise LifecycleError(
-                                "mangoapp_not_ready",
-                                "gamescope-mangoapp.service did not return to active",
-                            )
-            except Exception as error:
-                self._restore_state(prior)
-                self._restore_integration_files(
-                    integration_snapshot,
-                    prior is not None and prior.active_version is not None,
-                )
-                self._rollback_running_services(
-                    gamescope_was_active, test_provider_was_active
-                )
-                retained = {
-                    retained_version
-                    for retained_version in (
-                        prior.active_runtime if prior else None,
-                        prior.previous_runtime if prior else None,
+                previous_runtime=(
+                    prior.previous_runtime
+                    if same_runtime
+                    else prior.active_runtime if prior is not None else None
+                ),
+                generation=generation,
+            )
+            self._write_state(state)
+            if integration_changed:
+                self._reload_and_enable_integration()
+            if not same_runtime:
+                self._checked_systemctl("try-restart", "mango-overlayd.service")
+                if test_provider_was_active:
+                    self._checked_systemctl(
+                        "restart", "mango-overlay-test-provider.service"
                     )
-                    if retained_version is not None
-                }
-                if runtime_id not in retained:
-                    self._remove_owned_tree(self.paths.versions / runtime_id)
-                self._unlink_if_exists(self.paths.transaction_file)
-                if isinstance(error, LifecycleError):
-                    raise
-                raise LifecycleError("activation_failed", str(error)) from error
-
+                if gamescope_was_active:
+                    self._checked_systemctl(
+                        "restart", "gamescope-mangoapp.service"
+                    )
+                    if not self._gamescope_active():
+                        raise LifecycleError(
+                            "mangoapp_not_ready",
+                            "gamescope-mangoapp.service did not return to active",
+                        )
+        except Exception as error:
+            self._restore_state(prior)
+            self._restore_integration_files(
+                integration_snapshot,
+                prior is not None and prior.active_version is not None,
+            )
+            self._rollback_running_services(
+                gamescope_was_active, test_provider_was_active
+            )
+            retained = {
+                retained_version
+                for retained_version in (
+                    prior.active_runtime if prior else None,
+                    prior.previous_runtime if prior else None,
+                )
+                if retained_version is not None
+            }
+            if not retain_candidates and runtime_id not in retained:
+                self._remove_owned_tree(self.paths.versions / runtime_id)
             self._unlink_if_exists(self.paths.transaction_file)
-            if self._path_exists(self.paths.pending_uninstall_file):
-                self._unlink_if_exists(self.paths.pending_uninstall_file)
-                self._stop_cleanup_timer()
+            if isinstance(error, LifecycleError):
+                raise
+            raise LifecycleError("activation_failed", str(error)) from error
+
+        self._unlink_if_exists(self.paths.transaction_file)
+        if self._path_exists(self.paths.pending_uninstall_file):
+            self._unlink_if_exists(self.paths.pending_uninstall_file)
+            self._stop_cleanup_timer()
+        if not retain_candidates:
             self._prune_versions(state)
-            return state
+        return state
 
     def mark_pending_uninstall(
         self,
         plugin_root: Path,
         generation: str,
+        *,
+        coordinator_token: str | None = None,
+        coordinator_product_id: str | None = None,
     ) -> str:
         self._validate_generation(generation)
         plugin_root = plugin_root.absolute()
+        coordinated = coordinator_token is not None or coordinator_product_id is not None
+        if coordinated and (coordinator_token is None or coordinator_product_id is None):
+            raise LifecycleError(
+                "invalid_coordinator_claim",
+                "Coordinator token and product identity must be supplied together",
+            )
         with self._locked():
             self._recover_incomplete_locked()
             state = self._read_state()
-            if state is None or state.active_version is None:
-                raise LifecycleError("not_installed", "No active runtime is installed")
-            if state.generation != generation:
-                raise LifecycleError(
-                    "stale_generation",
-                    "The uninstall callback does not own the active generation",
-                )
-            self._validate_plugin(plugin_root, state.active_version)
+            if coordinated:
+                # A shared claim may belong to a product whose candidate is
+                # retained but is not the currently active revision.  Its
+                # uninstall record must still be durable so the coordinator
+                # can remove exactly that claim later.
+                self._validate_pending_plugin_root(plugin_root)
+            else:
+                if state is None or state.active_version is None:
+                    raise LifecycleError("not_installed", "No active runtime is installed")
+                if state.generation != generation:
+                    raise LifecycleError(
+                        "stale_generation",
+                        "The uninstall callback does not own the active generation",
+                    )
+                self._validate_plugin(plugin_root, state.active_version)
             plugin_info = plugin_root.lstat()
             token = self._token_factory()
             if _TOKEN.fullmatch(token) is None:
                 raise LifecycleError("invalid_token", "Invalid uninstall token")
+            if coordinator_token is not None and _TOKEN.fullmatch(coordinator_token) is None:
+                raise LifecycleError("invalid_token", "Invalid coordinator token")
+            if coordinator_product_id is not None and (
+                not isinstance(coordinator_product_id, str)
+                or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}", coordinator_product_id)
+                is None
+            ):
+                raise LifecycleError("invalid_product_id", "Invalid coordinator product identity")
+            pending_value: dict[str, object] = {
+                "schema": STATE_SCHEMA,
+                "token": token,
+                "generation": generation,
+                "plugin_root": str(plugin_root),
+                "plugin_device": plugin_info.st_dev,
+                "plugin_inode": plugin_info.st_ino,
+                "created_at": self._now(),
+            }
+            if coordinator_token is not None:
+                pending_value["coordinator_token"] = coordinator_token
+            if coordinator_product_id is not None:
+                pending_value["coordinator_product_id"] = coordinator_product_id
             self._write_json(
                 self.paths.pending_uninstall_file,
-                {
-                    "schema": STATE_SCHEMA,
-                    "token": token,
-                    "generation": generation,
-                    "plugin_root": str(plugin_root),
-                    "plugin_device": plugin_info.st_dev,
-                    "plugin_inode": plugin_info.st_ino,
-                    "created_at": self._now(),
-                },
+                pending_value,
             )
         self._checked_systemctl_quick(
             "--no-block", "restart", "mango-overlay-cleanup.timer"
@@ -493,6 +787,10 @@ class LifecycleManager:
         return token
 
     def finalize_pending_uninstall(self, token: str | None = None) -> bool:
+        # Read and validate the pending record under the lifecycle lock, then
+        # release it before taking the coordinator lock. Registration takes
+        # the locks in the opposite order (coordinator -> lifecycle), so this
+        # two-phase shape avoids a cross-product deadlock.
         with self._locked():
             pending = self._read_pending()
             if pending is None:
@@ -502,17 +800,56 @@ class LifecycleManager:
                 return False
             state = self._read_state()
             if state is None or state.generation != pending["generation"]:
-                self._unlink_if_exists(self.paths.pending_uninstall_file)
-                self._stop_cleanup_timer()
-                return False
+                if not self._pending_is_coordinated(pending):
+                    self._unlink_if_exists(self.paths.pending_uninstall_file)
+                    self._stop_cleanup_timer()
+                    return False
             plugin_presence = self._pending_plugin_presence(pending)
-            if plugin_presence == "original" or plugin_presence == "ambiguous":
+            if plugin_presence in {"original", "ambiguous"}:
                 return False
             if plugin_presence == "replacement":
                 self._unlink_if_exists(self.paths.pending_uninstall_file)
                 self._stop_cleanup_timer()
                 return False
             if self._now() - pending["created_at"] < UNINSTALL_GRACE_SECONDS:
+                return False
+
+        shared_result = self._finalize_coordinator_claim(pending)
+        if shared_result == "wait":
+            return False
+        if shared_result == "retained":
+            with self._locked():
+                current = self._read_pending()
+                if current is not None and (
+                    token is None or current["token"] == token
+                ):
+                    self._unlink_if_exists(self.paths.pending_uninstall_file)
+                    self._stop_cleanup_timer()
+            return True
+
+        with self._locked():
+            # Re-check after the coordinator transaction; a replacement may
+            # have arrived while the locks were released.
+            current = self._read_pending()
+            if current is None:
+                self._stop_cleanup_timer()
+                return False
+            if token is not None and current["token"] != token:
+                return False
+            state = self._read_state()
+            if (
+                not self._pending_is_coordinated(current)
+                and (state is None or state.generation != current["generation"])
+            ):
+                self._unlink_if_exists(self.paths.pending_uninstall_file)
+                self._stop_cleanup_timer()
+                return False
+            presence = self._pending_plugin_presence(current)
+            if presence in {"original", "ambiguous"}:
+                return False
+            if presence == "replacement":
+                self._unlink_if_exists(self.paths.pending_uninstall_file)
+                self._stop_cleanup_timer()
                 return False
 
             cleanup_roots = (
@@ -585,6 +922,11 @@ class LifecycleManager:
             or not isinstance(manifest.get("files"), list)
         ):
             raise LifecycleError("invalid_manifest", "Runtime manifest is invalid")
+        core_version = manifest.get("core_version", version)
+        if not isinstance(core_version, str):
+            raise LifecycleError(
+                "invalid_core_version", "Runtime manifest core version is invalid"
+            )
         entries = self._validate_manifest_entries(manifest["files"])
         required = {
             "bin/mangoapp",
@@ -596,7 +938,7 @@ class LifecycleManager:
             raise LifecycleError(
                 "invalid_manifest", "Runtime manifest is missing required binaries"
             )
-        runtime_id = self._runtime_id(version, entries)
+        runtime_id = self._runtime_id(version, core_version, entries)
 
         self._ensure_private_directory(self.paths.data_root)
         self._ensure_private_directory(self.paths.versions)
@@ -632,11 +974,13 @@ class LifecycleManager:
     @staticmethod
     def _runtime_id(
         version: str,
+        core_version: str,
         entries: dict[str, dict[str, object]],
     ) -> str:
         canonical = {
             "schema": MANIFEST_SCHEMA,
             "version": version,
+            "core_version": core_version,
             "files": [
                 {
                     "path": relative,
@@ -716,11 +1060,15 @@ class LifecycleManager:
             if stat.S_IMODE(path.stat().st_mode) != entry["mode"]:
                 raise LifecycleError("runtime_mismatch", "Runtime mode differs")
 
-    def _install_integration_files(self, plugin_root: Path) -> bool:
+    def _install_integration_files(self, plugin_root: Path | None) -> bool:
         self._ensure_private_directory(self.paths.libexec_root)
-        source_root = plugin_root / "py_modules/mango_overlay_decky"
+        source_root = (
+            plugin_root / "py_modules/mango_overlay_decky"
+            if plugin_root is not None
+            else self.paths.libexec_root
+        )
         changed = False
-        for name in ("lifecycle.py", "launcher.py"):
+        for name in ("lifecycle.py", "launcher.py", "coordinator.py"):
             changed |= self._copy_if_changed(
                 source_root / name,
                 self.paths.libexec_root / name,
@@ -776,6 +1124,7 @@ class LifecycleManager:
         return {
             "lifecycle": self.paths.libexec_root / "lifecycle.py",
             "launcher": self.paths.libexec_root / "launcher.py",
+            "coordinator": self.paths.libexec_root / "coordinator.py",
             "broker_socket": self.paths.systemd_user_root / "mango-overlayd.socket",
             "broker_service": self.paths.systemd_user_root / "mango-overlayd.service",
             "cleanup_service": (
@@ -825,14 +1174,17 @@ class LifecycleManager:
         self, raw: object
     ) -> dict[Path, tuple[bytes, int] | None]:
         paths = self._integration_paths()
-        if not isinstance(raw, dict) or set(raw) != set(paths):
+        if not isinstance(raw, dict) or not set(raw).issubset(paths):
             raise LifecycleError(
                 "invalid_transaction", "Integration snapshot is invalid"
             )
         decoded: dict[Path, tuple[bytes, int] | None] = {}
         total_size = 0
         for name, path in paths.items():
-            entry = raw[name]
+            # ``coordinator.py`` was added after the first lifecycle schema;
+            # an interrupted old transaction simply has no snapshot entry for
+            # that helper and should recover as ``None``.
+            entry = raw.get(name)
             if entry is None:
                 decoded[path] = None
                 continue
@@ -936,6 +1288,9 @@ class LifecycleManager:
             prior_installed,
         )
         candidate = transaction.get("candidate")
+        retain_candidate = transaction.get("retain_candidate", False)
+        if not isinstance(retain_candidate, bool):
+            raise LifecycleError("invalid_transaction", "Candidate retention flag is invalid")
         gamescope_was_active = self._gamescope_active()
         if prior_installed:
             self._checked_systemctl("try-restart", "mango-overlayd.service")
@@ -950,7 +1305,11 @@ class LifecycleManager:
             )
             if runtime_id is not None
         }
-        if isinstance(candidate, str) and candidate not in retained:
+        if (
+            isinstance(candidate, str)
+            and not retain_candidate
+            and candidate not in retained
+        ):
             self._remove_owned_tree(self.paths.versions / candidate)
 
     def _prune_versions(self, state: LifecycleState) -> None:
@@ -985,6 +1344,24 @@ class LifecycleManager:
             or package_manifest.get("version") != version
         ):
             raise LifecycleError("invalid_plugin", "Decky plugin identity differs")
+
+    def _validate_pending_plugin_root(self, plugin_root: Path) -> None:
+        """Validate a coordinated product directory without assuming ownership."""
+
+        try:
+            info = plugin_root.lstat()
+        except FileNotFoundError as error:
+            raise LifecycleError("invalid_plugin", "Decky plugin root is missing") from error
+        if not _plugin_directory_is_trusted(info, self._uid):
+            raise LifecycleError("invalid_plugin", "Decky plugin root is unsafe")
+        plugin_manifest = self._read_plugin_json(plugin_root / "plugin.json", 65536)
+        package_manifest = self._read_plugin_json(plugin_root / "package.json", 65536)
+        if plugin_manifest.get("name") != PLUGIN_NAME:
+            raise LifecycleError("invalid_plugin", "Decky plugin identity differs")
+        version = package_manifest.get("version")
+        if not isinstance(version, str):
+            raise LifecycleError("invalid_plugin", "Decky plugin version is invalid")
+        self._validate_version(version)
 
     def _pending_plugin_presence(self, pending: dict[str, object]) -> str:
         plugin_root = Path(str(pending["plugin_root"]))
@@ -1106,6 +1483,8 @@ class LifecycleManager:
         plugin_device = raw.get("plugin_device")
         plugin_inode = raw.get("plugin_inode")
         created_at = raw.get("created_at")
+        coordinator_token = raw.get("coordinator_token")
+        coordinator_product_id = raw.get("coordinator_product_id")
         if (
             raw.get("schema") != STATE_SCHEMA
             or not isinstance(token, str)
@@ -1125,9 +1504,140 @@ class LifecycleManager:
                 )
             )
             or not isinstance(created_at, (int, float))
+            or (
+                coordinator_token is not None
+                and (
+                    not isinstance(coordinator_token, str)
+                    or _TOKEN.fullmatch(coordinator_token) is None
+                )
+            )
+            or (
+                coordinator_product_id is not None
+                and (
+                    not isinstance(coordinator_product_id, str)
+                    or re.fullmatch(
+                        r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}",
+                        coordinator_product_id,
+                    )
+                    is None
+                )
+            )
         ):
             raise LifecycleError("invalid_pending", "Pending uninstall state is invalid")
         return raw
+
+    @staticmethod
+    def _pending_is_coordinated(pending: dict[str, object]) -> bool:
+        return (
+            isinstance(pending.get("coordinator_token"), str)
+            and isinstance(pending.get("coordinator_product_id"), str)
+        )
+
+    def _finalize_coordinator_claim(
+        self, pending: dict[str, object]
+    ) -> str:
+        """Remove one shared claim, returning ``last``, ``retained`` or ``wait``.
+
+        A pending record without coordinator metadata is an older single
+        plugin installation and continues through the legacy finalizer.
+        """
+
+        token = pending.get("coordinator_token")
+        product_id = pending.get("coordinator_product_id")
+        if not isinstance(token, str) or not isinstance(product_id, str):
+            coordinator_state = self.paths.data_root / "coordinator" / "state.json"
+            if not self._path_exists(coordinator_state):
+                return "last"
+            try:
+                raw = self._read_json(coordinator_state, 512 * 1024)
+                claims = raw.get("claims")
+                return "wait" if isinstance(claims, list) and claims else "last"
+            except LifecycleError:
+                return "wait"
+        try:
+            try:
+                from .coordinator import (
+                    CoordinatorPaths,
+                    RuntimeCoordinator,
+                )
+            except ImportError:
+                from coordinator import (  # type: ignore[no-redef]
+                    CoordinatorPaths,
+                    RuntimeCoordinator,
+                )
+            operations = LifecycleRuntimeOperations(
+                self,
+                plugin_root=None,
+                plugin_version=None,
+                generation=str(pending["generation"]),
+            )
+            coordinator = RuntimeCoordinator(
+                CoordinatorPaths.for_home(self.paths.home), operations
+            )
+            before = coordinator.status()
+            if not any(claim.product_id == product_id for claim in before.claims):
+                if not before.claims:
+                    return "last"
+                if before.active_revision is None:
+                    return "wait"
+                # Another finalizer may have removed this claim already.  The
+                # remaining claims still own the shared runtime, so converge
+                # the local lifecycle pointer and finish this stale pending
+                # record instead of retrying it forever.
+                self._sync_state_from_coordinator(before)
+                return "retained"
+            outcome = coordinator.finalize_removal(
+                product_id,
+                str(pending["generation"]),
+                token=token,
+                plugin_present=False,
+            )
+            if outcome.action in {"pending", "blocked", "failed"}:
+                return "wait"
+            after = coordinator.status()
+            if not after.claims:
+                return "last"
+            if after.active_revision is None:
+                return "wait"
+            self._sync_state_from_coordinator(after)
+            return "retained"
+        except Exception:
+            # The pending record remains for a later retry if coordinator state
+            # is temporarily unavailable or malformed.
+            return "wait"
+
+    def _sync_state_from_coordinator(self, status: object) -> None:
+        active_revision = getattr(status, "active_revision", None)
+        claims = getattr(status, "claims", ())
+        if not isinstance(active_revision, str):
+            raise LifecycleError("coordinator_state_invalid", "No active shared revision")
+        active_claim = next(
+            (
+                claim
+                for claim in claims
+                if getattr(claim.candidate, "content_revision", None)
+                == active_revision
+            ),
+            None,
+        )
+        if active_claim is None:
+            raise LifecycleError("coordinator_state_invalid", "Active claim is missing")
+        runtime = self.ensure_prepared_runtime(active_revision)
+        manifest = self._read_json(runtime / "manifest.json", 1024 * 1024)
+        version = manifest.get("version")
+        generation = getattr(active_claim, "generation", None)
+        if not isinstance(version, str) or not isinstance(generation, str):
+            raise LifecycleError("coordinator_state_invalid", "Active claim metadata is invalid")
+        with self._locked():
+            self._write_state(
+                LifecycleState(
+                    active_version=version,
+                    previous_version=None,
+                    generation=generation,
+                    active_runtime=active_revision,
+                    previous_runtime=None,
+                )
+            )
 
     def _gamescope_active(self) -> bool:
         return self._unit_active("gamescope-mangoapp.service")

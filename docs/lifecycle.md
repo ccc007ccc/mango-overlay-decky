@@ -73,6 +73,7 @@ ready   -> failed -> system_fallback
 ~/homebrew/plugins/mango-overlay-decky/          Decky 当前插件包
 ~/.local/libexec/mango-overlay-decky/            稳定启动与生命周期助手
 ~/.local/share/mango-overlay-decky/runtime/       内容寻址的不可变运行时修订
+~/.local/share/mango-overlay-decky/coordinator/   共享核心声明、活动指针和失败修订
 ~/.local/state/mango-overlay-decky/               事务、活动版本和有界日志
 ~/.config/mango-overlay-decky/                    用户设置
 ~/.cache/mango-overlay-decky/                     可重新生成的资源缓存
@@ -87,11 +88,11 @@ ready   -> failed -> system_fallback
 
 每份运行时清单经规范化后生成 SHA-256 修订 ID，目录以修订 ID 命名。`install.json` 分别记录对外的 `active_version` / `previous_version`、内部的 `active_runtime` / `previous_runtime` 和当前插件 generation。相同版本、相同内容的 Loader 重载复用修订且不重启；相同版本、不同内容的测试包按正常更新事务切换到新修订，旧修订仍可回滚。路径和 Decky 插件标识已经固定，清理不得根据模糊名称或目录扫描删除文件。
 
-## 多产品共享核心目标（首版后）
+## 多产品共享核心
 
-第一版安装状态只服务于 Mango Overlay Decky 自身。未来第三方产品插件直接内置该运行时
-时，生命周期所有权仍属于本项目，并升级为多运行时声明模型；调用方不得复制
-`LifecycleManager` 后各自争抢 drop-in。
+生命周期所有权由本项目的 Runtime Coordinator 统一维护；产品插件不得复制
+`LifecycleManager` 后各自争抢 drop-in。每个产品先把自己的不可变运行时修订复制到共享
+`runtime/versions/<sha256>`，再提交有界声明。
 
 快速路径按以下规则实现：
 
@@ -108,7 +109,20 @@ ready   -> failed -> system_fallback
 claim，`_uninstall` 只标记当前产品 pending removal，最后一个 claim 被确认移除后才执行
 本文件定义的最终卸载。
 
-这一节是已接受但尚未实现的后续架构，不能用于声称当前包已经支持多产品仲裁。
+稳定助手提供以下最小命令面，输出为有界 JSON：
+
+```text
+launcher.py coordinator status
+launcher.py coordinator register ...
+launcher.py coordinator pending-remove ...
+launcher.py coordinator finalize ...
+launcher.py coordinator retry [content-revision]
+```
+
+`register` 只比较候选的 Mango 核心语义版本；产品插件版本不参与比较。结构校验会确认
+候选修订已经落盘，但只有被选中的最高候选才运行二进制自检。活动指针由协调器状态文件
+拥有，启动器读取它而不是根据目录猜测。最后一个声明确认移除后才恢复系统 MangoApp；
+仍有其他声明时只切换到下一个可用核心并保留共享运行时。
 
 第一版活动修订只拥有游戏模式所需文件：
 
@@ -125,16 +139,18 @@ runtime/licenses/                             随包私有库许可证
 
 新插件 `_main()` 调用稳定生命周期助手：
 
-1. 获取生命周期锁。
-2. 清除属于本次安装的过期待确认卸载记录。
-3. 根据清单生成运行时修订 ID，并把插件包内运行时复制到同文件系统的临时修订目录。
-4. 校验清单、文件权限并运行游戏模式二进制自检。
-5. 原子重命名为正式修订目录。
-6. 原子提交包含活动版本、活动修订和回滚修订的安装状态。
-7. 安装指向稳定启动助手的用户级 service drop-in。
-8. 安装 `mango-overlayd.socket` 与对应服务单元，执行 `systemctl --user daemon-reload` 并启用 socket。
-9. 仅当 `gamescope-mangoapp.service` 原本处于活动状态时热重启；服务未运行时不擅自启动游戏模式组件。
-10. 连接场景代理并等待渲染器就绪。失败时恢复系统 MangoApp，并保留诊断信息。
+1. 根据清单生成运行时修订 ID，并把插件包内运行时复制到共享候选目录。
+2. 结构校验候选清单并提交自己的持久声明。
+3. 协调器按核心语义版本选出唯一候选；只有被选中的候选运行游戏模式二进制自检。
+4. 获取生命周期锁，原子切换活动修订并提交安装状态。
+5. 清除属于本次安装的过期待确认卸载记录。
+6. 安装指向稳定启动助手的用户级 service drop-in。
+7. 安装 `mango-overlayd.socket` 与对应服务单元，执行 `systemctl --user daemon-reload` 并启用 socket。
+8. 仅当 `gamescope-mangoapp.service` 原本处于活动状态时热重启；服务未运行时不擅自启动游戏模式组件。
+9. 连接场景代理并等待渲染器就绪。失败时隔离该修订并回退已知可用核心或系统 MangoApp。
+
+从没有协调器状态的旧安装迁移时，首次声明会先读取旧活动修订作为 known-good；新候选
+失败不会先拆掉这份活动指针。只有确认没有任何声明时才恢复系统 MangoApp。
 
 ## 插件更新
 
@@ -155,13 +171,16 @@ cleanup timer 的确认窗口为 3 秒；只要旧目录仍存在、同路径出
 
 新版本 `_main()` 启动后：
 
-1. 获取同一生命周期锁。
-2. 通过插件标识确认自己是合法替代版本，并取消待确认卸载。
-3. 把新运行时写入独立暂存目录并完整验证；包版本相同但清单内容不同仍是新修订。
-4. 保留当前活动修订为回滚修订，再原子切换活动修订。
-5. 仅在 MangoApp 服务原本活动时热重启并等待新版本就绪。
-6. 启动失败则原子恢复 `previous`；再次失败才回退系统 MangoApp。
-7. 成功后提交版本状态，并只保留一个已验证回滚版本。
+1. 把新运行时写入共享候选目录并提交新的 generation 声明，取消自己的待确认卸载。
+2. 同产品低核心版本替换被拒绝；新最高版本才进入激活事务。
+3. 保留当前活动修订为已知可用版本，再原子切换活动修订。
+4. 仅在 MangoApp 服务原本活动时热重启并等待新版本就绪。
+5. 启动失败则隔离精确修订并按版本向下回退；再次失败才回退系统 MangoApp。
+6. 成功后提交协调器活动指针和安装状态。
+
+同一产品后端重载若仍提交相同内容修订，只刷新该产品 claim 的 generation，不重新运行自检
+或重启渲染器。共享核心中的非活动产品也会写入自己的待确认卸载记录；最终核对先移除
+对应 claim，只有最后一个 claim 消失才执行全局清理。
 
 更新过程中断时：
 

@@ -21,4 +21,13 @@ export interface PluginStatus {
   broker: BrokerStatus | null;
   error: string | null;
   test_canvas: boolean;
+  coordinator?: {
+    active_revision?: string | null;
+    known_good_revision?: string | null;
+    failed_revisions?: string[];
+    verified_revisions?: string[];
+    last_error?: string | null;
+    claim_count?: number;
+    error?: string;
+  };
 }

@@ -14,7 +14,17 @@ from mango_overlay_decky.lifecycle import (
     LifecycleError,
     LifecycleManager,
     LifecyclePaths,
+    LifecycleRuntimeOperations,
 )
+from mango_overlay_decky.coordinator import (
+    CoordinatorError,
+    CoordinatorPaths,
+    RuntimeClaim,
+    RuntimeCoordinator,
+)
+
+
+PRODUCT_ID = "mango-overlay-decky"
 
 
 class Plugin:
@@ -25,12 +35,46 @@ class Plugin:
         self._paths = LifecyclePaths.for_home(Path(decky.DECKY_USER_HOME))
         self._manager = LifecycleManager(self._paths)
         try:
-            self._state = await asyncio.to_thread(
-                self._manager.activate,
-                self._plugin_root,
-                decky.DECKY_PLUGIN_VERSION,
-                self._generation,
+            prepare_candidate = getattr(
+                self._manager, "prepare_runtime_candidate", None
             )
+            if callable(prepare_candidate):
+                self._candidate = await asyncio.to_thread(
+                    prepare_candidate,
+                    self._plugin_root,
+                    decky.DECKY_PLUGIN_VERSION,
+                )
+                self._operations = LifecycleRuntimeOperations(
+                    self._manager,
+                    plugin_root=self._plugin_root,
+                    plugin_version=decky.DECKY_PLUGIN_VERSION,
+                    generation=self._generation,
+                )
+                self._coordinator = RuntimeCoordinator(
+                    CoordinatorPaths.for_home(Path(decky.DECKY_USER_HOME)),
+                    self._operations,
+                )
+                outcome = await asyncio.to_thread(
+                    self._coordinator.register,
+                    RuntimeClaim(PRODUCT_ID, self._generation, self._candidate),
+                )
+                if outcome.action in {"blocked", "failed"}:
+                    detail = outcome.error or outcome.action
+                    raise LifecycleError(
+                        "coordinator_" + outcome.action,
+                        f"Shared Mango core could not be selected: {detail}",
+                    )
+                self._state = await asyncio.to_thread(self._manager.status)
+            else:
+                # Compatibility for an older helper during an in-place Decky
+                # update; the new packaged helper always takes the coordinator
+                # path above.
+                self._state = await asyncio.to_thread(
+                    self._manager.activate,
+                    self._plugin_root,
+                    decky.DECKY_PLUGIN_VERSION,
+                    self._generation,
+                )
         except Exception as exception:
             self._activation_error = f"激活失败：{exception}"
             decky.logger.exception("Mango Overlay activation failed")
@@ -53,7 +97,25 @@ class Plugin:
             )
             return
         try:
-            token = manager.mark_pending_uninstall(plugin_root, generation)
+            coordinator_token: str | None = None
+            coordinator = getattr(self, "_coordinator", None)
+            if coordinator is not None:
+                try:
+                    coordinator_token = coordinator.mark_pending_removal(
+                        PRODUCT_ID, generation
+                    )
+                except CoordinatorError as error:
+                    if error.code not in {"claim_not_found", "stale_generation"}:
+                        raise
+            if coordinator_token is None:
+                token = manager.mark_pending_uninstall(plugin_root, generation)
+            else:
+                token = manager.mark_pending_uninstall(
+                    plugin_root,
+                    generation,
+                    coordinator_token=coordinator_token,
+                    coordinator_product_id=PRODUCT_ID,
+                )
         except LifecycleError as error:
             if error.code in {"not_installed", "stale_generation"}:
                 decky.logger.info(
@@ -108,7 +170,7 @@ class Plugin:
             except (OSError, subprocess.SubprocessError, RuntimeError) as exception:
                 broker = None
                 error = str(exception)
-        return {
+        result: dict[str, Any] = {
             "plugin_version": decky.DECKY_PLUGIN_VERSION,
             "active_version": state.active_version,
             "previous_version": state.previous_version,
@@ -116,6 +178,24 @@ class Plugin:
             "error": error,
             "test_canvas": test_canvas,
         }
+        coordinator = getattr(self, "_coordinator", None)
+        if coordinator is not None:
+            try:
+                coordinator_status = await asyncio.to_thread(coordinator.status)
+            except Exception as exception:
+                result["coordinator"] = {"error": str(exception)[:512]}
+            else:
+                result["coordinator"] = {
+                    "active_revision": coordinator_status.active_revision,
+                    "known_good_revision": coordinator_status.known_good_revision,
+                    "failed_revisions": list(coordinator_status.failed_revisions),
+                    "verified_revisions": list(
+                        getattr(coordinator_status, "verified_revisions", ())
+                    ),
+                    "last_error": coordinator_status.last_error,
+                    "claim_count": len(coordinator_status.claims),
+                }
+        return result
 
     async def set_enabled(self, enabled: bool) -> dict[str, Any]:
         if type(enabled) is not bool:
